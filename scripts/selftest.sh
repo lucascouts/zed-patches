@@ -131,7 +131,7 @@ test_lib_falls_back_to_default_distdir() {
 	local tmp out
 	tmp="$(mktemp -d)"
 	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
-	out="$(PATH="/nonexistent" ZP_OVERLAY="${tmp}/overlay" bash -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'; printf '%s' \"\${ZP_DISTFILE}\"" 2>&1)"
+	out="$(PATH="/nonexistent" ZP_OVERLAY="${tmp}/overlay" "${BASH}" -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'; printf '%s' \"\${ZP_DISTFILE}\"" 2>&1)"
 	assert_contains "${out}" "/var/cache/distfiles" && ok
 	rm -rf "${tmp}"
 }
