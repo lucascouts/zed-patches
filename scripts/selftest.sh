@@ -61,9 +61,16 @@ assert_equal() {
 	return 0
 }
 
+# tree_checksum <dir> — content digest of a tree, independent of where it lives.
+# sha256sum prints the path next to each hash, so this must run from inside the
+# directory: with absolute paths two identical trees in different temp dirs would
+# never digest the same, and the immutability cases compare across temp dirs.
 tree_checksum() {
-	find "$1" -path '*/.git' -prune -o -type f -print0 |
-		sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+	(
+		cd "$1" || return 1
+		find . -path '*/.git' -prune -o -type f -print0 |
+			sort -z | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1
+	)
 }
 
 # --- fixture builders -------------------------------------------------------
