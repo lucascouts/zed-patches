@@ -82,6 +82,7 @@ make_ebuild() {
 	{
 		echo 'EAPI=8'
 		[[ "${commit}" == "-" ]] || echo "EGIT_COMMIT=\"${commit}\""
+		# shellcheck disable=SC2016  # ebuild syntax written verbatim; must not expand here
 		echo 'SRC_URI="https://example.invalid/${EGIT_COMMIT}.tar.gz -> ${PF}.tar.gz"'
 	} >"${dir}/app-editors/zed/${FIXTURE_PV}.ebuild"
 }
