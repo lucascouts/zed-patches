@@ -95,6 +95,15 @@ longer in the live overlay):
 `tar`, `patch`, `git`, `portageq` and `shellcheck` — all part of a normal Gentoo system.
 No new dependency is introduced: `quilt` is deliberately absent.
 
-## Scope
+## License
 
-Local repository, no remote. Publication is a later decision.
+MIT — see [`LICENSE`](LICENSE).
+
+**What MIT covers:** everything original to this repository — `scripts/`, the `series`
+files and this README.
+
+**What it does not:** the `patches/**/*.patch` files are diffs against
+[Zed](https://github.com/zed-industries/zed), so their added and removed lines are
+excerpts of Zed's own source and remain under Zed's license (GPL-3.0). The MIT grant
+above cannot and does not relicense that material; it applies to the tooling that
+manages the patches, not to the upstream code they carry.

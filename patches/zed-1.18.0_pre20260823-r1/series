@@ -1,0 +1,21 @@
+# Apply order and USE-flag grouping, mirroring src_prepare() in
+# app-editors/zed/zed-1.18.0_pre20260823-r1.ebuild.
+
+# @feature: claude-agent-acp-plus
+0001-force-enable-claude-agent-acp-plus.patch
+# 0003/0004 (per-option _meta description + preview) retired: upstream 950ec79
+# surfaces option descriptions natively via the ACP EnumOption.description
+# field, superseding the _claude/askUserQuestionOption _meta machinery (and
+# renamed MultiSelectItems::Untitled -> String). The numbers stay retired so
+# the remaining filenames keep matching the ebuild's PATCHES+=() lines.
+0005-elicitation-multiline-fields.patch
+0006-elicitation-option-previews.patch
+0007-manual-mode-badge.patch
+0008-clickable-attachments.patch
+# 0009: adopt the agent's config-option response when applying per-agent
+# defaults, so options that appear as a side effect (Fast mode once the
+# resolved model supports it) surface without a manual model switch.
+0009-Adopt-agent-s-config-option-response-when-applying-d.patch
+
+# @feature: claude-code-ide
+0002-claude-code-ide-integration.patch
