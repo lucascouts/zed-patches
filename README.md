@@ -52,6 +52,7 @@ isolation — the default run applies **every** patch, which is the strictest ca
 | `scripts/verify.sh <PF> [--feature=<flag>]` | sequential `patch --dry-run` of the whole series against the prepared tree |
 | `scripts/sync-overlay.sh <PF> [--dry-run]` | copy the verified series into the overlay's `files/`, reporting orphans |
 | `scripts/refresh.sh --from <PF_old> --to <PF_new>` | carry the series onto a new packaged commit, regenerating each patch |
+| `scripts/check-sync.sh [<PF>]` | verify the series against the ebuild, the overlay and the packaged source, in one pass |
 | `scripts/selftest.sh` | unit coverage, entirely on temporary fixtures — never touches the overlay or the real distfile |
 
 Exit codes are uniform: `0` success · `1` a patch did not apply · `2` environment
@@ -89,6 +90,30 @@ longer in the live overlay):
 | `ZP_DISTDIR` | `portageq distdir`, falling back to `/var/cache/distfiles` |
 | `ZP_WORKROOT` | `<repo>/work` |
 | `ZP_REPO` | the repository root |
+
+### Staying in sync
+
+```bash
+scripts/check-sync.sh
+```
+
+One pass over the three relations a drift can travel along:
+
+| Relation | Catches |
+|---|---|
+| series ↔ ebuild | a patch the ebuild applies but the series never names, or the reverse |
+| patches ↔ overlay | a patch edited on one side only, and any overlay file the series does not name |
+| patches ↔ source | a patch that stopped applying to the packaged tree |
+
+The first is the one no other script checks. `sync-overlay.sh` copies what the
+series names and reports what the overlay has spare, but neither side reads the
+ebuild — so a patch the ebuild quietly stopped applying stays present in both
+and looks correct from either end.
+
+With no `<PF>` the version comes from the overlay when it holds exactly one zed
+ebuild. Exit is 0 when everything agrees, 1 on drift, 2 on an environment
+problem. `patches ↔ source` reports `SKIP` rather than failing when no tree has
+been prepared — nothing drifted, the question simply was not asked.
 
 ### `.zp-overlay` — which checkout gets written
 

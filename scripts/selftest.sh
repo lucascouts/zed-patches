@@ -481,6 +481,31 @@ test_verify_feature_filter() {
 
 # --- sync-overlay.sh (R6.1 - R6.5) ------------------------------------------
 
+# add_ebuild_patches <overlay> <name>... — give the fixture ebuild a
+# src_prepare that applies the named patches, so check-sync.sh has an ebuild
+# side to compare the series against.
+add_ebuild_patches() {
+	local overlay="$1"
+	shift
+	local ebuild="${overlay}/app-editors/zed/${FIXTURE_PV}.ebuild" name
+	{
+		echo 'src_prepare() {'
+		echo '	PATCHES+=('
+		# shellcheck disable=SC2016  # ebuild syntax written verbatim; must not expand here
+		for name in "$@"; do printf '\t\t"${FILESDIR}/%s"\n' "${name}"; done
+		echo '	)'
+		echo '	default'
+		echo '}'
+	} >>"${ebuild}"
+}
+
+run_checksync() {
+	local tmp="$1"
+	shift
+	ZP_OVERLAY="${tmp}/overlay" ZP_DISTDIR="${tmp}/distfiles" ZP_WORKROOT="${tmp}/work" \
+		ZP_REPO="${tmp}/repo" bash "${SCRIPTS}/check-sync.sh" "${FIXTURE_PV}" "$@" 2>&1
+}
+
 run_sync() {
 	local tmp="$1"
 	shift
@@ -559,6 +584,51 @@ test_sync_reports_zero_orphans_when_aligned() {
 	run_sync "${tmp}" >/dev/null
 	out="$(run_sync "${tmp}")"
 	assert_contains "${out}" "0 orphan" && ok
+	rm -rf "${tmp}"
+}
+
+# --- check-sync.sh: the three relations -------------------------------------
+
+test_checksync_reports_in_sync() {
+	case_start "check-sync: all three relations agree after a sync"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	verify_env "${tmp}"
+	add_ebuild_patches "${tmp}/overlay" "0001-first.patch" "0002-second.patch"
+	run_sync "${tmp}" >/dev/null
+	out="$(run_checksync "${tmp}")"
+	status=$?
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "in sync" && ok
+	rm -rf "${tmp}"
+}
+
+test_checksync_detects_overlay_drift() {
+	case_start "check-sync: a patch edited in the overlay only is reported as drift"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	verify_env "${tmp}"
+	add_ebuild_patches "${tmp}/overlay" "0001-first.patch" "0002-second.patch"
+	run_sync "${tmp}" >/dev/null
+	printf '\n# edited in the overlay only\n' >>"${tmp}/overlay/app-editors/zed/files/0001-first.patch"
+	out="$(run_checksync "${tmp}")"
+	status=$?
+	assert_status 1 "${status}" &&
+		assert_contains "${out}" "differs" && ok
+	rm -rf "${tmp}"
+}
+
+test_checksync_detects_ebuild_drift() {
+	case_start "check-sync: a patch the ebuild applies but the series omits is reported"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	verify_env "${tmp}"
+	add_ebuild_patches "${tmp}/overlay" "0001-first.patch" "0002-second.patch" "0003-ghost.patch"
+	run_sync "${tmp}" >/dev/null
+	out="$(run_checksync "${tmp}")"
+	status=$?
+	assert_status 1 "${status}" &&
+		assert_contains "${out}" "0003-ghost.patch" && ok
 	rm -rf "${tmp}"
 }
 
@@ -656,6 +726,10 @@ main() {
 	test_sync_dry_run_writes_nothing
 	test_sync_reports_orphans
 	test_sync_reports_zero_orphans_when_aligned
+
+	test_checksync_reports_in_sync
+	test_checksync_detects_overlay_drift
+	test_checksync_detects_ebuild_drift
 
 	test_refresh_preserves_source_set
 	test_refresh_refuses_existing_destination
