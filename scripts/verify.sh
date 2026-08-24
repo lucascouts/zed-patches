@@ -20,6 +20,43 @@ usage() {
 	exit 2
 }
 
+# restore_baseline <tree> -- put the tree back on its baseline commit when doing
+# so discards nothing.
+#
+# A dry-run only answers the question that was asked when the source it reads is
+# the packaged source. refresh.sh finishes with one commit per patch in the tree,
+# so a verify run straight after it -- the sequence the workflow documents --
+# would check the series against source that already carries it and report a
+# conflict describing nothing but the leftover state. Moving HEAD back to the
+# baseline restores the packaged files; the later commits stay reachable from the
+# branch they were made on, so patch-branches.sh and a half-finished fix survive.
+#
+# Uncommitted work is a different matter and is never touched: a tree someone is
+# still editing is a decision, so this refuses and names the way out.
+restore_baseline() {
+	local tree="$1" baseline head dirty
+	[[ -d "${tree}/.git" ]] || return 0
+	head="$(git -C "${tree}" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 0
+	[[ -n "${head}" ]] || return 0
+	baseline="$(git -C "${tree}" rev-list --max-parents=0 HEAD 2>/dev/null | tail -n1)"
+	[[ -n "${baseline}" ]] || return 0
+
+	# Tracked-file edits are checked first and on every run, baseline or not:
+	# source somebody is midway through editing invalidates the dry-run exactly
+	# as leftover commits do, and is the one state that must never be discarded.
+	# Untracked files are left out -- .rej leftovers and a cargo target/ do not
+	# change what a patch reads.
+	dirty="$(git -C "${tree}" status --porcelain --untracked-files=no 2>/dev/null)"
+	[[ -z "${dirty}" ]] ||
+		die 2 "the prepared tree at ${tree} carries uncommitted changes, so a dry-run there would not describe the packaged source -- commit them, or re-extract with: prepare-tree.sh ${ZP_PV} --force"
+
+	[[ "${head}" != "${baseline}" ]] || return 0
+
+	git -C "${tree}" checkout -q --detach "${baseline}" ||
+		die 2 "cannot restore the baseline commit in ${tree} -- re-extract with: prepare-tree.sh ${ZP_PV} --force"
+	printf 'restored the baseline commit in %s (later commits are untouched on their branch)\n\n' "${tree}"
+}
+
 main() {
 	local pf="" feature="" arg
 	for arg in "$@"; do
@@ -44,6 +81,8 @@ main() {
 
 	[[ -d "${ZP_WORKTREE}" ]] ||
 		die 2 "no prepared tree at ${ZP_WORKTREE} — run: prepare-tree.sh ${ZP_PV}"
+
+	restore_baseline "${ZP_WORKTREE}"
 
 	# read_series validates the whole series and dies 2 on a missing file or an
 	# unknown feature group, before any patch is read.

@@ -49,7 +49,7 @@ isolation — the default run applies **every** patch, which is the strictest ca
 | Command | Purpose |
 |---|---|
 | `scripts/prepare-tree.sh <PF> [--force]` | extract `${DISTDIR}/<PF>.tar.gz` into `work/zed-<commit>/` and give it a baseline commit |
-| `scripts/verify.sh <PF> [--feature=<flag>]` | sequential `patch --dry-run` of the whole series against the prepared tree |
+| `scripts/verify.sh <PF> [--feature=<flag>]` | sequential `patch --dry-run` of the whole series against the prepared tree, put back on its baseline first |
 | `scripts/sync-overlay.sh <PF> [--dry-run]` | copy the verified series into the overlay's `files/`, reporting orphans |
 | `scripts/refresh.sh --from <PF_old> --to <PF_new>` | carry the series onto a new packaged commit, regenerating each patch |
 | `scripts/check-sync.sh [<PF>]` | verify the series against the ebuild, the overlay and the packaged source, in one pass |
@@ -78,6 +78,15 @@ scripts/verify.sh zed-1.19.0_pre20260901
 scripts/sync-overlay.sh zed-1.19.0_pre20260901 --dry-run
 scripts/sync-overlay.sh zed-1.19.0_pre20260901
 ```
+
+Step 3 works straight after step 1 because `verify.sh` restores the baseline
+commit before it reads anything. `refresh.sh` finishes with one commit per patch
+in the prepared tree, and a dry-run against that would be checking the series
+against its own output -- every patch would report as already applied. The
+restore moves `HEAD` only: the refresh commits stay on their branch, so
+`patch-branches.sh` and a half-finished fix survive it. Uncommitted edits to
+tracked files are the one thing it will not touch -- those exit 2 and name the
+way out, because discarding somebody's work to answer a question is never worth it.
 
 ## Environment overrides
 

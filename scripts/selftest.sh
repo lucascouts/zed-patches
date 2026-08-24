@@ -464,6 +464,42 @@ test_verify_leaves_tree_untouched() {
 	rm -rf "${tmp}"
 }
 
+test_verify_restores_baseline_tree() {
+	case_start "verify: a tree left carrying refresh commits is put back on the baseline"
+	local tmp tree out status head baseline
+	tmp="$(mktemp -d)"
+	verify_env "${tmp}"
+	tree="${tmp}/work/zed-${FIXTURE_COMMIT}"
+	# Reproduce what refresh.sh leaves behind: the series applied to the tree,
+	# one commit per patch. Verifying against that would read its own output.
+	(cd "${tree}" && patch -p1 -f -g0 <"${tmp}/repo/patches/${FIXTURE_PV}/0001-first.patch" >/dev/null 2>&1)
+	git -C "${tree}" commit -aqm "refresh: 0001-first.patch"
+	out="$(run_verify "${tmp}")"
+	status=$?
+	head="$(git -C "${tree}" rev-parse HEAD)"
+	baseline="$(git -C "${tree}" rev-list --max-parents=0 HEAD)"
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "restored the baseline" &&
+		assert_equal "${baseline}" "${head}" && ok
+	rm -rf "${tmp}"
+}
+
+test_verify_refuses_modified_tree() {
+	case_start "verify: uncommitted source edits exit 2 and are left in place"
+	local tmp tree out status content
+	tmp="$(mktemp -d)"
+	verify_env "${tmp}"
+	tree="${tmp}/work/zed-${FIXTURE_COMMIT}"
+	printf 'fn main() {\n    println!("mid-edit");\n}\n' >"${tree}/src/main.rs"
+	out="$(run_verify "${tmp}")"
+	status=$?
+	content="$(cat "${tree}/src/main.rs")"
+	assert_status 2 "${status}" &&
+		assert_contains "${out}" "uncommitted changes" &&
+		assert_contains "${content}" "mid-edit" && ok
+	rm -rf "${tmp}"
+}
+
 test_verify_feature_filter() {
 	case_start "verify: --feature verifies only its group; unknown group exits 2"
 	local tmp out status unknown_status
@@ -758,6 +794,8 @@ main() {
 	test_verify_requires_prepared_tree
 	test_verify_leaves_tree_untouched
 	test_verify_feature_filter
+	test_verify_restores_baseline_tree
+	test_verify_refuses_modified_tree
 
 	test_sync_refuses_unverified
 	test_sync_copies_verified_series
