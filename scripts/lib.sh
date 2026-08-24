@@ -35,18 +35,42 @@ _zp_repo_root() {
 	(cd "${here}/.." && pwd)
 }
 
-# _zp_overlay — the bentoo repository. ZP_OVERLAY wins; portageq is asked only
-# when it is both needed and reachable.
+# _zp_overlay — the bentoo repository to read from and write to.
+#
+# Precedence, most explicit first:
+#   1. ZP_OVERLAY in the environment — a one-off override
+#   2. .zp-overlay at the repository root — the working overlay for this machine
+#   3. portageq — Portage's synced copy, the last resort
+#
+# 2 exists because portageq answers with the repository Portage SYNCS, and that
+# copy is a generated consumer, not a place to edit: a write there is undone by
+# the next sync, and until then it blocks that sync with local modifications.
+# Where the overlay is edited and pushed from a checkout elsewhere, only the
+# operator can name that path, so it is read from a file rather than guessed.
 _zp_overlay() {
-	local path=""
+	local path="" config="" line=""
 	if [[ -n "${ZP_OVERLAY:-}" ]]; then
 		printf '%s' "${ZP_OVERLAY}"
+		return 0
+	fi
+	config="${ZP_REPO:-$(_zp_repo_root)}/.zp-overlay"
+	if [[ -r "${config}" ]]; then
+		while IFS= read -r line || [[ -n "${line}" ]]; do
+			[[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
+			line="${line#"${line%%[![:space:]]*}"}"
+			line="${line%"${line##*[![:space:]]}"}"
+			path="${line}"
+			break
+		done <"${config}"
+		[[ -n "${path}" ]] || die 2 "${config} names no overlay path"
+		[[ -d "${path}" ]] || die 2 "${config} names ${path}, which is not a directory"
+		printf '%s' "${path}"
 		return 0
 	fi
 	if command -v portageq >/dev/null 2>&1; then
 		path="$(portageq get_repo_path / bentoo 2>/dev/null || true)"
 	fi
-	[[ -n "${path}" ]] || die 2 "cannot locate the bentoo overlay: set ZP_OVERLAY or make portageq available"
+	[[ -n "${path}" ]] || die 2 "cannot locate the bentoo overlay: set ZP_OVERLAY, write .zp-overlay, or make portageq available"
 	printf '%s' "${path}"
 }
 

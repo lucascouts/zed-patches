@@ -85,10 +85,37 @@ longer in the live overlay):
 
 | Variable | Default |
 |---|---|
-| `ZP_OVERLAY` | the `bentoo` repository reported by `portageq get_repo_path / bentoo` |
+| `ZP_OVERLAY` | the path in `.zp-overlay`, falling back to `portageq get_repo_path / bentoo` |
 | `ZP_DISTDIR` | `portageq distdir`, falling back to `/var/cache/distfiles` |
 | `ZP_WORKROOT` | `<repo>/work` |
 | `ZP_REPO` | the repository root |
+
+### `.zp-overlay` — which checkout gets written
+
+The scripts resolve the overlay in this order:
+
+1. `ZP_OVERLAY` in the environment — a one-off override
+2. `.zp-overlay` at the repository root — the working overlay for this machine
+3. `portageq get_repo_path / bentoo` — Portage's synced copy
+
+Step 2 exists because step 3 is the wrong answer wherever the overlay is edited
+somewhere other than `/var/db/repos`. The path `portageq` reports is the copy
+Portage **syncs**, which is a generated consumer: a write there is undone by the
+next sync, and until then it blocks that sync with local modifications. Only the
+operator knows where the real checkout lives, so it is named in a file rather
+than guessed.
+
+`.zp-overlay` holds one path; blank lines and `#` comments are ignored. It is
+per-machine and gitignored:
+
+```
+# The bentoo checkout this machine edits and pushes from.
+/home/you/src/bentoo
+```
+
+A file naming a path that is not a directory, or naming nothing at all, is an
+error with status 2 — never a silent fallback to `portageq`, which would put the
+write back on the copy this setting exists to avoid.
 
 ## Requirements
 

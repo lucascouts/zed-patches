@@ -144,6 +144,52 @@ test_lib_falls_back_to_default_distdir() {
 	rm -rf "${tmp}"
 }
 
+test_lib_reads_overlay_from_config() {
+	case_start "lib: .zp-overlay names the overlay when ZP_OVERLAY is unset"
+	local tmp out
+	tmp="$(mktemp -d)"
+	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
+	printf '# the working overlay\n\n  %s/overlay  \n' "${tmp}" >"${tmp}/.zp-overlay"
+	out="$(ZP_REPO="${tmp}" "${BASH}" -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'; printf '%s' \"\${ZP_OVERLAY}\"" 2>&1)"
+	assert_equal "${tmp}/overlay" "${out}" && ok
+	rm -rf "${tmp}"
+}
+
+test_lib_env_overrides_config() {
+	case_start "lib: ZP_OVERLAY in the environment wins over .zp-overlay"
+	local tmp out
+	tmp="$(mktemp -d)"
+	make_ebuild "${tmp}/chosen" "${FIXTURE_COMMIT}"
+	printf '%s/ignored\n' "${tmp}" >"${tmp}/.zp-overlay"
+	out="$(ZP_REPO="${tmp}" ZP_OVERLAY="${tmp}/chosen" "${BASH}" -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'; printf '%s' \"\${ZP_OVERLAY}\"" 2>&1)"
+	assert_equal "${tmp}/chosen" "${out}" && ok
+	rm -rf "${tmp}"
+}
+
+test_lib_rejects_config_naming_missing_dir() {
+	case_start "lib: .zp-overlay naming a missing directory dies with status 2"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	printf '%s/nowhere\n' "${tmp}" >"${tmp}/.zp-overlay"
+	out="$(ZP_REPO="${tmp}" "${BASH}" -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'" 2>&1)"
+	status=$?
+	assert_status 2 "${status}" &&
+		assert_contains "${out}" "not a directory" && ok
+	rm -rf "${tmp}"
+}
+
+test_lib_rejects_empty_config() {
+	case_start "lib: a comment-only .zp-overlay dies with status 2"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	printf '# nothing here\n\n' >"${tmp}/.zp-overlay"
+	out="$(ZP_REPO="${tmp}" "${BASH}" -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'" 2>&1)"
+	status=$?
+	assert_status 2 "${status}" &&
+		assert_contains "${out}" "names no overlay path" && ok
+	rm -rf "${tmp}"
+}
+
 # --- lib.sh: series parsing (R3.1, R3.2, R3.3) ------------------------------
 
 series_fixture() {
@@ -583,6 +629,10 @@ main() {
 	test_lib_resolves_commit
 	test_lib_rejects_ebuild_without_commit
 	test_lib_falls_back_to_default_distdir
+	test_lib_reads_overlay_from_config
+	test_lib_env_overrides_config
+	test_lib_rejects_config_naming_missing_dir
+	test_lib_rejects_empty_config
 
 	test_series_preserves_order
 	test_series_group_carries_forward

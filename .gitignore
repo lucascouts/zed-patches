@@ -2,3 +2,6 @@
 work/
 *.orig
 *.rej
+
+# local overlay pointer (per-machine path)
+.zp-overlay
