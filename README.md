@@ -53,6 +53,7 @@ isolation — the default run applies **every** patch, which is the strictest ca
 | `scripts/sync-overlay.sh <PF> [--dry-run]` | copy the verified series into the overlay's `files/`, reporting orphans |
 | `scripts/refresh.sh --from <PF_old> --to <PF_new>` | carry the series onto a new packaged commit, regenerating each patch |
 | `scripts/check-sync.sh [<PF>]` | verify the series against the ebuild, the overlay and the packaged source, in one pass |
+| `scripts/patch-branches.sh <PF> [--force]` | rebuild one branch per patch in the prepared tree, so a patch can be fixed as code |
 | `scripts/selftest.sh` | unit coverage, entirely on temporary fixtures — never touches the overlay or the real distfile |
 
 Exit codes are uniform: `0` success · `1` a patch did not apply · `2` environment
@@ -90,6 +91,36 @@ longer in the live overlay):
 | `ZP_DISTDIR` | `portageq distdir`, falling back to `/var/cache/distfiles` |
 | `ZP_WORKROOT` | `<repo>/work` |
 | `ZP_REPO` | the repository root |
+
+### Fixing a patch as code
+
+A patch is a diff, and a diff is an awkward thing to fix: resolving a conflict
+means editing context lines by hand and hoping the result still describes the
+change.
+
+```bash
+scripts/patch-branches.sh <PF>
+```
+
+builds one branch per patch in the prepared tree — `patch/0007-manual-mode-badge`
+and so on — each a single commit on the packaged source. Check one out, fix it
+with the compiler and the tests available, then regenerate:
+
+```bash
+cd work/zed-<commit>
+git checkout patch/0007-manual-mode-badge
+# edit, build, test
+git commit --amend
+git format-patch -1 --stdout >../../patches/<PF>/0007-manual-mode-badge.patch
+```
+
+The branches are not stored. They live in `work/`, which is disposable and
+gitignored, and the script rebuilds them from the series on demand — a second
+durable copy of the patches would be a second thing to keep in sync.
+
+A patch made with `git format-patch` is replayed with `git am`, so its author,
+date and message survive. A patch that arrived as a bare diff becomes a commit
+with a bare subject: no branch can invent reasoning nobody wrote down.
 
 ### Staying in sync
 

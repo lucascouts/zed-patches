@@ -499,6 +499,13 @@ add_ebuild_patches() {
 	} >>"${ebuild}"
 }
 
+run_branches() {
+	local tmp="$1"
+	shift
+	ZP_OVERLAY="${tmp}/overlay" ZP_DISTDIR="${tmp}/distfiles" ZP_WORKROOT="${tmp}/work" \
+		ZP_REPO="${tmp}/repo" bash "${SCRIPTS}/patch-branches.sh" "${FIXTURE_PV}" "$@" 2>&1
+}
+
 run_checksync() {
 	local tmp="$1"
 	shift
@@ -584,6 +591,37 @@ test_sync_reports_zero_orphans_when_aligned() {
 	run_sync "${tmp}" >/dev/null
 	out="$(run_sync "${tmp}")"
 	assert_contains "${out}" "0 orphan" && ok
+	rm -rf "${tmp}"
+}
+
+# --- patch-branches.sh: one branch per patch --------------------------------
+
+test_branches_one_per_patch() {
+	case_start "branches: one branch per patch, each a single commit on the baseline"
+	local tmp status count parents
+	tmp="$(mktemp -d)"
+	verify_env "${tmp}"
+	run_branches "${tmp}" >/dev/null
+	status=$?
+	count="$(git -C "${tmp}/work/zed-${FIXTURE_COMMIT}" branch --list 'patch/*' | wc -l)"
+	parents="$(git -C "${tmp}/work/zed-${FIXTURE_COMMIT}" rev-list --count 'patch/0001-first')"
+	assert_status 0 "${status}" &&
+		assert_equal "2" "${count}" &&
+		assert_equal "2" "${parents}" && ok
+	rm -rf "${tmp}"
+}
+
+test_branches_leave_tree_on_baseline() {
+	case_start "branches: the prepared tree is left clean on the baseline"
+	local tmp dirty head baseline
+	tmp="$(mktemp -d)"
+	verify_env "${tmp}"
+	run_branches "${tmp}" >/dev/null
+	dirty="$(git -C "${tmp}/work/zed-${FIXTURE_COMMIT}" status --porcelain | wc -l)"
+	head="$(git -C "${tmp}/work/zed-${FIXTURE_COMMIT}" rev-parse HEAD)"
+	baseline="$(git -C "${tmp}/work/zed-${FIXTURE_COMMIT}" rev-list --max-parents=0 HEAD)"
+	assert_equal "0" "${dirty}" &&
+		assert_equal "${baseline}" "${head}" && ok
 	rm -rf "${tmp}"
 }
 
@@ -726,6 +764,9 @@ main() {
 	test_sync_dry_run_writes_nothing
 	test_sync_reports_orphans
 	test_sync_reports_zero_orphans_when_aligned
+
+	test_branches_one_per_patch
+	test_branches_leave_tree_on_baseline
 
 	test_checksync_reports_in_sync
 	test_checksync_detects_overlay_drift
