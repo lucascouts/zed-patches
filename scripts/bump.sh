@@ -134,10 +134,26 @@ if bash "${SCRIPTS}/check-sync.sh" "${to}"; then
 	exit 0
 fi
 
-# check-sync failing after a clean refresh and verify is the expected handoff,
-# not a surprise: the ebuild is the one file this script will not write.
-printf '\n\033[1mthe series is ready; the ebuild is not.\033[0m\n'
-printf '\nEdit the PATCHES+=() blocks in:\n  %s/%s/%s.ebuild\n' "${overlay}" "${ZP_CATEGORY_PATH}" "${to}"
-printf '\nso they name exactly what patches/%s/series names, under the same USE\n' "${to}"
-printf 'conditionals. Then re-run this, or check-sync.sh alone, to confirm.\n'
+# check-sync can fail for two unrelated reasons here, and saying the wrong one
+# sends the reader to edit a file that is already correct.
+#
+# In a dry run the overlay was deliberately not written, so "patches <-> overlay"
+# drifting is this script's own doing and means nothing about the ebuild. Only a
+# "series <-> ebuild" disagreement is the handoff this script exists to stop at.
+if bash "${SCRIPTS}/check-sync.sh" "${to}" 2>&1 | grep -q '^DRIFT *series <-> ebuild'; then
+	printf '\n\033[1mthe series is ready; the ebuild is not.\033[0m\n'
+	printf '\nEdit the PATCHES+=() blocks in:\n  %s/%s/%s.ebuild\n' "${overlay}" "${ZP_CATEGORY_PATH}" "${to}"
+	printf '\nso they name exactly what patches/%s/series names, under the same USE\n' "${to}"
+	printf 'conditionals. Then re-run this, or check-sync.sh alone, to confirm.\n'
+	exit 1
+fi
+
+if [[ "${apply}" != "yes" ]]; then
+	printf '\n\033[1mthe series is ready; the overlay was not written.\033[0m\n'
+	printf '\nThe ebuild and the series agree. What drifted is the overlay copy, which\n'
+	printf 'this run deliberately left alone. Re-run with --apply to write it.\n'
+	exit 1
+fi
+
+printf '\n\033[1mdrift remains after applying — see check-sync.sh above.\033[0m\n'
 exit 1
