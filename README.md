@@ -48,6 +48,7 @@ isolation — the default run applies **every** patch, which is the strictest ca
 
 | Command | Purpose |
 |---|---|
+| `scripts/bump.sh [--from <PF>] [--to <PF>] [--apply]` | carry the series onto the version the overlay now packages: refresh, verify, sync, check — stopping at the ebuild |
 | `scripts/prepare-tree.sh <PF> [--force]` | extract `${DISTDIR}/<PF>.tar.gz` into `work/zed-<commit>/` and give it a baseline commit |
 | `scripts/verify.sh <PF> [--feature=<flag>]` | sequential `patch --dry-run` of the whole series against the prepared tree, put back on its baseline first |
 | `scripts/sync-overlay.sh <PF> [--dry-run]` | copy the verified series into the overlay's `files/`, reporting orphans |
@@ -64,20 +65,43 @@ place that already knows which commit is packaged.
 
 ## Workflow for a version bump
 
+Once Portage has fetched the new distfile and the overlay carries the new ebuild:
+
 ```sh
-# 1. Portage has fetched the new distfile and the overlay carries the new ebuild.
+scripts/bump.sh            # refresh, verify, sync (dry run), check — writes nothing
+scripts/bump.sh --apply    # the same, and the sync writes for real
+```
+
+Both versions are discovered when not given: `--to` from the overlay's single zed
+ebuild, `--from` as the newest series in `patches/` that is not `--to`. Each step gates
+the next, so a run either reaches the end or stops where a human is needed.
+
+**It never edits the ebuild.** Which patches apply, and under which USE flag, is the one
+part of a bump encoding intent no script can infer. When the refreshed series stops
+matching `PATCHES+=()`, `bump.sh` says exactly that and exits 1 — the handoff, not a
+failure.
+
+The steps individually, which is also what to reach for when a run stops:
+
+```sh
+# 1. Regenerate. Stops at the first conflict, keeping the .rej files: a patch that no
+#    longer applies is a decision, not a mechanical fix. See "Fixing a patch as code".
 scripts/refresh.sh --from zed-1.18.0_pre20260822 --to zed-1.19.0_pre20260901
 
-# 2. Resolve any conflict by hand: refresh.sh stops at the first one and keeps
-#    the .rej files. A patch that no longer applies is a decision, not a mechanical fix.
-
-# 3. Confirm the regenerated set applies cleanly.
+# 2. Confirm the regenerated set applies, from a restored baseline.
 scripts/verify.sh zed-1.19.0_pre20260901
 
-# 4. Push the verified patches into the overlay, then update PATCHES+=() by hand.
+# 3. Copy into the overlay. Verification runs again here as a gate.
 scripts/sync-overlay.sh zed-1.19.0_pre20260901 --dry-run
 scripts/sync-overlay.sh zed-1.19.0_pre20260901
+
+# 4. Update PATCHES+=() by hand, then confirm all three relations agree.
+scripts/check-sync.sh zed-1.19.0_pre20260901
 ```
+
+`bump.sh` re-running `verify` inside `sync-overlay.sh` is deliberate duplication: the
+sync's own gate is what guarantees `files/` never receives an unchecked patch, and
+skipping it to save a `patch --dry-run` would trade that guarantee for nothing.
 
 Step 3 works straight after step 1 because `verify.sh` restores the baseline
 commit before it reads anything. `refresh.sh` finishes with one commit per patch
