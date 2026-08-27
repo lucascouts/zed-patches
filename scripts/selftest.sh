@@ -515,6 +515,58 @@ test_verify_feature_filter() {
 	rm -rf "${tmp}"
 }
 
+# stacked_verify_env <tmp> — a series whose second patch only applies once the
+# first has been applied: both touch src/main.rs, and 0002 expects the text 0001
+# produces. Checking each patch against the pristine source rejects 0002; the
+# ebuild, which applies them in order, does not. That gap is what this fixture
+# pins, and the real series has the same shape in 0007/0010.
+stacked_verify_env() {
+	local tmp="$1"
+	prepare_env "${tmp}"
+	run_prepare "${tmp}" >/dev/null
+	local pdir="${tmp}/repo/patches/${FIXTURE_PV}"
+	mkdir -p "${pdir}"
+	make_patch "${pdir}/0001-first.patch" "src/main.rs" \
+		'fn main() {
+    println!("one");
+}
+' 'fn main() {
+    println!("two");
+}
+'
+	make_patch "${pdir}/0002-stacked.patch" "src/main.rs" \
+		'fn main() {
+    println!("two");
+}
+' 'fn main() {
+    println!("three");
+}
+'
+	cat >"${pdir}/series" <<-EOS
+		0001-first.patch
+		0002-stacked.patch
+	EOS
+}
+
+test_verify_applies_series_cumulatively() {
+	case_start "verify: a stacked patch is read with its predecessor applied"
+	local tmp out status tree before after leftovers
+	tmp="$(mktemp -d)"
+	stacked_verify_env "${tmp}"
+	tree="${tmp}/work/zed-${FIXTURE_COMMIT}"
+	before="$(tree_checksum "${tree}")"
+	out="$(run_verify "${tmp}")"
+	status=$?
+	after="$(tree_checksum "${tree}")"
+	# The scratch worktree lives under the work root and must not outlive the run.
+	leftovers="$(find "${tmp}/work" -maxdepth 1 -name '.verify-*' 2>/dev/null | wc -l)"
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "0002-stacked.patch" &&
+		assert_equal "${before}" "${after}" &&
+		assert_equal "0" "${leftovers}" && ok
+	rm -rf "${tmp}"
+}
+
 # --- sync-overlay.sh (R6.1 - R6.5) ------------------------------------------
 
 # add_ebuild_patches <overlay> <name>... — give the fixture ebuild a
@@ -796,6 +848,7 @@ main() {
 	test_verify_feature_filter
 	test_verify_restores_baseline_tree
 	test_verify_refuses_modified_tree
+	test_verify_applies_series_cumulatively
 
 	test_sync_refuses_unverified
 	test_sync_copies_verified_series

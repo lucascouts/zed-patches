@@ -50,7 +50,7 @@ isolation — the default run applies **every** patch, which is the strictest ca
 |---|---|
 | `scripts/bump.sh [--from <PF>] [--to <PF>] [--apply]` | carry the series onto the version the overlay now packages: refresh, verify, sync, check — stopping at the ebuild |
 | `scripts/prepare-tree.sh <PF> [--force]` | extract `${DISTDIR}/<PF>.tar.gz` into `work/zed-<commit>/` and give it a baseline commit |
-| `scripts/verify.sh <PF> [--feature=<flag>]` | sequential `patch --dry-run` of the whole series against the prepared tree, put back on its baseline first |
+| `scripts/verify.sh <PF> [--feature=<flag>]` | apply the whole series cumulatively, in a throwaway worktree cut from the prepared tree's baseline -- never in the tree itself |
 | `scripts/sync-overlay.sh <PF> [--dry-run]` | copy the verified series into the overlay's `files/`, reporting orphans |
 | `scripts/refresh.sh --from <PF_old> --to <PF_new>` | carry the series onto a new packaged commit, regenerating each patch |
 | `scripts/check-sync.sh [<PF>]` | verify the series against the ebuild, the overlay and the packaged source, in one pass |
@@ -101,16 +101,27 @@ scripts/check-sync.sh zed-1.19.0_pre20260901
 
 `bump.sh` re-running `verify` inside `sync-overlay.sh` is deliberate duplication: the
 sync's own gate is what guarantees `files/` never receives an unchecked patch, and
-skipping it to save a `patch --dry-run` would trade that guarantee for nothing.
+skipping it to save one `patch` run would trade that guarantee for nothing.
 
-Step 3 works straight after step 1 because `verify.sh` restores the baseline
-commit before it reads anything. `refresh.sh` finishes with one commit per patch
-in the prepared tree, and a dry-run against that would be checking the series
-against its own output -- every patch would report as already applied. The
-restore moves `HEAD` only: the refresh commits stay on their branch, so
-`patch-branches.sh` and a half-finished fix survive it. Uncommitted edits to
-tracked files are the one thing it will not touch -- those exit 2 and name the
-way out, because discarding somebody's work to answer a question is never worth it.
+Step 3 works straight after step 1 because `verify.sh` never reads the prepared
+tree's working files. It cuts a throwaway worktree from that tree's baseline
+commit and applies the series there, for real and in order. `refresh.sh` finishes
+with one commit per patch in the prepared tree, and checking against that would be
+checking the series against its own output -- cutting from the baseline sidesteps
+that entirely, and the prepared tree's build output is never in reach of a patch.
+
+Applying **cumulatively** is the point of the exercise. Each patch is handed the
+source with every earlier one already in place, which is how `eapply` will read it.
+Checking each patch against pristine source answers a weaker question, and on a
+stacked pair it can report a false pass or a false failure. This series has such a
+pair: `0010` expects the hunks `0007` adds.
+
+`verify.sh` still puts the prepared tree back on its baseline, because the rest of
+the tooling expects to find it there. The restore moves `HEAD` only: the refresh
+commits stay on their branch, so `patch-branches.sh` and a half-finished fix survive
+it. Uncommitted edits to tracked files are the one thing it will not touch -- those
+exit 2 and name the way out, because discarding somebody's work to answer a question
+is never worth it.
 
 ## Environment overrides
 
