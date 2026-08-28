@@ -1,0 +1,658 @@
+From 05ee93175276052a710a98d25bda8fc06d95039f Mon Sep 17 00:00:00 2001
+From: lucascouts <diego.evangelista5642@gmail.com>
+Date: Fri, 28 Aug 2026 16:21:38 -0300
+Subject: [PATCH] feat(agent_ui): show account quota, not just session context
+
+Zed reports how full the *session context* is and nothing about the *account*.
+The two answer different questions: a fresh session has an empty context and may
+still be out of weekly quota, which is exactly when a user wants to know.
+
+The data already arrives and is discarded. `claude-agent-acp-plus` forwards the
+Claude SDK's `rate_limit_event` on the `usage_update` notification, under
+`_meta["_claude/rateLimit"]` -- ACP has no field for account quota, so the
+adapter uses the extension channel the protocol reserves for this. Nothing in
+`acp_thread`, `agent_servers` or `agent_ui` read that key.
+
+Model it in `acp_thread` and render it as an "Account" section in the context
+tooltip, next to Context and Cost.
+
+Two details drove the design:
+
+  * The SDK reports ONE window per event -- the one that moved -- not the full
+    set. `AccountUsage::ingest` therefore keys windows by kind and updates in
+    place; replacing would make the five-hour bar vanish the moment a weekly
+    event arrived.
+
+  * `utilization` has been seen as both 0..1 and 0..100, so it is normalised and
+    then clamped: a bar must never render past its track.
+
+An unrecognised `rateLimitType` is dropped rather than guessed -- a quota bar
+under the wrong label is worse than one fewer bar. Agents that send no such
+`_meta` (every agent but the Claude adapter) yield an empty set and the section
+does not render at all.
+
+Covered by seven unit tests in `acp_thread`, including the accumulate-not-replace
+regression and the percent normalisation.
+---
+ crates/acp_thread/src/acp_thread.rs           | 343 +++++++++++++++++-
+ crates/agent_ui/src/agent_diff.rs             |   1 +
+ crates/agent_ui/src/conversation_view.rs      |   9 +
+ .../src/conversation_view/thread_view.rs      | 113 +++++-
+ 4 files changed, 463 insertions(+), 3 deletions(-)
+
+diff --git a/crates/acp_thread/src/acp_thread.rs b/crates/acp_thread/src/acp_thread.rs
+index 194a528..41af005 100644
+--- a/crates/acp_thread/src/acp_thread.rs
++++ b/crates/acp_thread/src/acp_thread.rs
+@@ -29,7 +29,7 @@ use project::{
+ };
+ use serde::{Deserialize, Serialize};
+ use serde_json::to_string_pretty;
+-use std::collections::HashMap;
++use std::collections::{BTreeMap, HashMap};
+ use std::error::Error;
+ use std::fmt::{Formatter, Write};
+ use std::ops::Range;
+@@ -2025,6 +2025,206 @@ pub struct SessionCost {
+     pub currency: SharedString,
+ }
+ 
++/// Which quota an [`AccountUsageWindow`] describes.
++///
++/// These are the `rateLimitType` values the Claude agent SDK emits on a
++/// `rate_limit_event`. They are carried to us verbatim by the ACP adapter under
++/// `_meta["_claude/rateLimit"]`; see [`AcpThread::account_usage`] for why we accumulate
++/// them rather than replacing.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum AccountUsageWindowKind {
++    /// The rolling five-hour session window.
++    FiveHour,
++    /// The seven-day window across all models.
++    SevenDay,
++    /// The seven-day window for the Opus-class model specifically.
++    SevenDayOpus,
++    /// The seven-day window for the Sonnet-class model specifically.
++    SevenDaySonnet,
++    /// The seven-day window, counting overage the plan includes.
++    SevenDayOverageIncluded,
++    /// Paid overage beyond the plan's included usage.
++    Overage,
++}
++
++impl AccountUsageWindowKind {
++    fn from_wire(value: &str) -> Option<Self> {
++        Some(match value {
++            "five_hour" => Self::FiveHour,
++            "seven_day" => Self::SevenDay,
++            "seven_day_opus" => Self::SevenDayOpus,
++            "seven_day_sonnet" => Self::SevenDaySonnet,
++            "seven_day_overage_included" => Self::SevenDayOverageIncluded,
++            "overage" => Self::Overage,
++            // An unknown window is dropped rather than guessed: showing a quota bar
++            // under the wrong label is worse than showing one fewer bar.
++            _ => return None,
++        })
++    }
++
++    /// A short label suitable for a usage row.
++    pub fn label(self) -> &'static str {
++        match self {
++            Self::FiveHour => "Session (5h)",
++            Self::SevenDay => "Weekly",
++            Self::SevenDayOpus => "Weekly (Opus)",
++            Self::SevenDaySonnet => "Weekly (Sonnet)",
++            Self::SevenDayOverageIncluded => "Weekly (incl. overage)",
++            Self::Overage => "Overage",
++        }
++    }
++}
++
++/// How close a window is to its limit, as the agent reported it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum AccountUsageStatus {
++    Allowed,
++    Warning,
++    Rejected,
++}
++
++impl AccountUsageStatus {
++    fn from_wire(value: &str) -> Option<Self> {
++        Some(match value {
++            "allowed" => Self::Allowed,
++            "allowed_warning" => Self::Warning,
++            "rejected" => Self::Rejected,
++            _ => return None,
++        })
++    }
++}
++
++/// One account quota window: how full it is, and when it resets.
++///
++/// Distinct from [`TokenUsage`], which measures the *context window of this session*.
++/// This measures the *account*, and the two answer different questions — a fresh session
++/// has an empty context and may still be out of weekly quota.
++#[derive(Debug, Clone, PartialEq)]
++pub struct AccountUsageWindow {
++    pub kind: AccountUsageWindowKind,
++    pub status: AccountUsageStatus,
++    /// Fraction of the quota consumed, `0.0..=1.0`. `None` when the agent did not report it.
++    pub utilization: Option<f32>,
++    /// Unix seconds at which this window resets. `None` when the agent did not report it.
++    pub resets_at: Option<i64>,
++}
++
++/// Account-level quota state, accumulated across `rate_limit_event`s.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct AccountUsage {
++    windows: BTreeMap<AccountUsageWindowKind, AccountUsageWindow>,
++    /// Set when the agent reported that continuing requires purchasing credits.
++    pub credits_required: bool,
++    /// Whether the account is currently drawing on paid overage.
++    pub using_overage: bool,
++}
++
++impl AccountUsage {
++    /// Every known window, ordered shortest-to-longest by [`AccountUsageWindowKind`].
++    pub fn windows(&self) -> impl Iterator<Item = &AccountUsageWindow> {
++        self.windows.values()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.windows.is_empty()
++    }
++
++    /// The window closest to its limit, which is the one worth surfacing when there is
++    /// room for only one.
++    pub fn most_constrained(&self) -> Option<&AccountUsageWindow> {
++        self.windows
++            .values()
++            .max_by(|a, b| match (a.status, b.status) {
++                (x, y) if x == y => a
++                    .utilization
++                    .unwrap_or(0.)
++                    .total_cmp(&b.utilization.unwrap_or(0.)),
++                (AccountUsageStatus::Rejected, _) => std::cmp::Ordering::Greater,
++                (_, AccountUsageStatus::Rejected) => std::cmp::Ordering::Less,
++                (AccountUsageStatus::Warning, _) => std::cmp::Ordering::Greater,
++                (_, AccountUsageStatus::Warning) => std::cmp::Ordering::Less,
++                _ => std::cmp::Ordering::Equal,
++            })
++    }
++
++    /// Fold one `_meta["_claude/rateLimit"]` payload in.
++    ///
++    /// Returns true when anything changed, so the caller can avoid a spurious redraw.
++    ///
++    /// **Why this accumulates instead of replacing.** The SDK reports ONE window per
++    /// event — the one that moved — not the full set. Replacing on each event would make
++    /// the five-hour bar vanish the moment a weekly event arrived. Windows are therefore
++    /// keyed by kind and updated in place, so the panel shows every window the session has
++    /// heard about.
++    fn ingest(&mut self, payload: &serde_json::Value) -> bool {
++        let Some(object) = payload.as_object() else {
++            return false;
++        };
++
++        let mut changed = false;
++
++        let credits_required =
++            object.get("errorCode").and_then(|v| v.as_str()) == Some("credits_required");
++        if credits_required != self.credits_required {
++            self.credits_required = credits_required;
++            changed = true;
++        }
++
++        let using_overage = object
++            .get("isUsingOverage")
++            .or_else(|| object.get("overageInUse"))
++            .and_then(|v| v.as_bool())
++            .unwrap_or(false);
++        if using_overage != self.using_overage {
++            self.using_overage = using_overage;
++            changed = true;
++        }
++
++        // `rateLimitType` and `status` are both needed to place a bar. Without the kind we
++        // do not know which window moved; without the status we cannot colour it. Either
++        // one missing means this event carries only the account-wide flags handled above.
++        let Some(kind) = object
++            .get("rateLimitType")
++            .and_then(|v| v.as_str())
++            .and_then(AccountUsageWindowKind::from_wire)
++        else {
++            return changed;
++        };
++        let Some(status) = object
++            .get("status")
++            .and_then(|v| v.as_str())
++            .and_then(AccountUsageStatus::from_wire)
++        else {
++            return changed;
++        };
++
++        let window = AccountUsageWindow {
++            kind,
++            status,
++            utilization: object
++                .get("utilization")
++                .and_then(|v| v.as_f64())
++                // The wire has carried both 0..1 and 0..100 in the wild; normalise, then
++                // clamp, so a bar can never render past its track.
++                .map(|v| (if v > 1.0 { v / 100.0 } else { v }).clamp(0.0, 1.0) as f32),
++            resets_at: object.get("resetsAt").and_then(|v| v.as_i64()),
++        };
++
++        if self.windows.get(&kind) != Some(&window) {
++            self.windows.insert(kind, window);
++            changed = true;
++        }
++        changed
++    }
++}
++
++/// The `_meta` key the ACP adapter writes the Claude rate-limit payload under.
++///
++/// This is an adapter extension, not ACP: `session/update`'s `UsageUpdate` carries `used`
++/// and `size` (the session context) and nothing about the account. `claude-agent-acp-plus`
++/// forwards the SDK's `rate_limit_event` here instead of dropping it.
++const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
++
+ pub const TOKEN_USAGE_WARNING_THRESHOLD: f32 = 0.8;
+ 
+ impl TokenUsage {
+@@ -2104,6 +2304,7 @@ pub struct AcpThread {
+     running_turn: Option<RunningTurn>,
+     connection: Rc<dyn AgentConnection>,
+     token_usage: Option<TokenUsage>,
++    account_usage: AccountUsage,
+     cost: Option<SessionCost>,
+     prompt_capabilities: acp::PromptCapabilities,
+     available_commands: Vec<acp::AvailableCommand>,
+@@ -2158,6 +2359,7 @@ pub enum AcpThreadEvent {
+     NewEntry,
+     TitleUpdated,
+     TokenUsageUpdated,
++    AccountUsageUpdated,
+     EntryUpdated(usize),
+     EntriesRemoved(Range<usize>),
+     ToolAuthorizationRequested(acp::ToolCallId),
+@@ -2317,6 +2519,7 @@ impl AcpThread {
+             connection,
+             session_id,
+             token_usage: None,
++            account_usage: AccountUsage::default(),
+             cost: None,
+             prompt_capabilities,
+             available_commands: Vec::new(),
+@@ -2483,6 +2686,15 @@ impl AcpThread {
+         self.token_usage.as_ref()
+     }
+ 
++    /// Account-level quota state, as last reported by the agent.
++    ///
++    /// Empty until a `rate_limit_event` arrives — which for the Claude adapter only
++    /// happens once the session has produced assistant output, since the adapter attaches
++    /// the payload to a `usage_update` it emits alongside token usage.
++    pub fn account_usage(&self) -> Option<&AccountUsage> {
++        (!self.account_usage.is_empty()).then_some(&self.account_usage)
++    }
++
+     pub fn cost(&self) -> Option<&SessionCost> {
+         self.cost.as_ref()
+     }
+@@ -2647,7 +2859,18 @@ impl AcpThread {
+                         currency: cost.currency.into(),
+                     });
+                 }
++                // The account quota rides in `_meta` on the same notification. Absent for
++                // every agent but the Claude adapter, so its absence is the normal case
++                // and must stay silent.
++                let account_changed = update
++                    .meta
++                    .as_ref()
++                    .and_then(|meta| meta.get(CLAUDE_RATE_LIMIT_META_KEY))
++                    .is_some_and(|payload| self.account_usage.ingest(payload));
+                 cx.emit(AcpThreadEvent::TokenUsageUpdated);
++                if account_changed {
++                    cx.emit(AcpThreadEvent::AccountUsageUpdated);
++                }
+             }
+             _ => {}
+         }
+@@ -4764,6 +4987,124 @@ fn markdown_for_raw_output(
+ 
+ #[cfg(test)]
+ mod tests {
++
++    // --- account usage (`_meta["_claude/rateLimit"]`) -------------------------------
++
++    fn rate_limit(kind: &str, status: &str, utilization: f64) -> serde_json::Value {
++        serde_json::json!({
++            "status": status,
++            "rateLimitType": kind,
++            "utilization": utilization,
++            "resetsAt": 1_800_000_000i64,
++        })
++    }
++
++    #[test]
++    fn account_usage_accumulates_windows_instead_of_replacing_them() {
++        // The regression this guards: the SDK sends ONE window per event. A naive
++        // implementation that assigns rather than merges makes the five-hour bar vanish
++        // the instant a weekly event arrives.
++        let mut usage = AccountUsage::default();
++        assert!(usage.ingest(&rate_limit("five_hour", "allowed", 0.25)));
++        assert!(usage.ingest(&rate_limit("seven_day", "allowed_warning", 0.9)));
++
++        let kinds: Vec<_> = usage.windows().map(|w| w.kind).collect();
++        assert_eq!(
++            kinds,
++            vec![
++                AccountUsageWindowKind::FiveHour,
++                AccountUsageWindowKind::SevenDay
++            ],
++            "both windows must survive, ordered shortest-first"
++        );
++    }
++
++    #[test]
++    fn account_usage_updates_a_window_in_place() {
++        let mut usage = AccountUsage::default();
++        usage.ingest(&rate_limit("five_hour", "allowed", 0.25));
++        assert!(usage.ingest(&rate_limit("five_hour", "allowed_warning", 0.85)));
++        assert_eq!(usage.windows().count(), 1, "same kind must not duplicate");
++
++        let window = usage.windows().next().unwrap();
++        assert_eq!(window.status, AccountUsageStatus::Warning);
++        assert_eq!(window.utilization, Some(0.85));
++    }
++
++    #[test]
++    fn account_usage_reports_no_change_when_nothing_moved() {
++        let mut usage = AccountUsage::default();
++        assert!(usage.ingest(&rate_limit("five_hour", "allowed", 0.25)));
++        assert!(
++            !usage.ingest(&rate_limit("five_hour", "allowed", 0.25)),
++            "an identical payload must not report a change, or the panel redraws on every turn"
++        );
++    }
++
++    #[test]
++    fn account_usage_normalises_percent_and_clamps() {
++        let mut usage = AccountUsage::default();
++        usage.ingest(&rate_limit("five_hour", "allowed", 42.0));
++        assert_eq!(usage.windows().next().unwrap().utilization, Some(0.42));
++
++        usage.ingest(&rate_limit("seven_day", "rejected", 137.0));
++        let clamped = usage
++            .windows()
++            .find(|w| w.kind == AccountUsageWindowKind::SevenDay)
++            .unwrap();
++        assert_eq!(
++            clamped.utilization,
++            Some(1.0),
++            "a bar must never render past its track"
++        );
++    }
++
++    #[test]
++    fn account_usage_drops_unknown_windows_rather_than_guessing() {
++        let mut usage = AccountUsage::default();
++        assert!(!usage.ingest(&rate_limit("thirty_day_something_new", "allowed", 0.5)));
++        assert!(
++            usage.is_empty(),
++            "an unrecognised window must be dropped — a bar under the wrong label is worse than one fewer bar"
++        );
++    }
++
++    #[test]
++    fn account_usage_reads_account_flags_without_a_window() {
++        // `errorCode`/`isUsingOverage` arrive on events that carry no rateLimitType.
++        let mut usage = AccountUsage::default();
++        assert!(usage.ingest(&serde_json::json!({
++            "status": "rejected",
++            "errorCode": "credits_required",
++            "isUsingOverage": true,
++        })));
++        assert!(usage.credits_required);
++        assert!(usage.using_overage);
++        assert!(
++            usage.is_empty(),
++            "no window was named, so no bar may appear"
++        );
++    }
++
++    #[test]
++    fn account_usage_ignores_a_non_object_payload() {
++        let mut usage = AccountUsage::default();
++        assert!(!usage.ingest(&serde_json::json!("nonsense")));
++        assert!(!usage.ingest(&serde_json::Value::Null));
++        assert!(usage.is_empty());
++    }
++
++    #[test]
++    fn most_constrained_prefers_status_over_utilization() {
++        let mut usage = AccountUsage::default();
++        usage.ingest(&rate_limit("five_hour", "allowed", 0.99));
++        usage.ingest(&rate_limit("seven_day", "rejected", 0.10));
++        assert_eq!(
++            usage.most_constrained().unwrap().kind,
++            AccountUsageWindowKind::SevenDay,
++            "a rejected window outranks a merely-full one"
++        );
++    }
+     use super::*;
+     use anyhow::anyhow;
+     use feature_flags::FeatureFlag as _;
+diff --git a/crates/agent_ui/src/agent_diff.rs b/crates/agent_ui/src/agent_diff.rs
+index 9995be3..6f7ae1d 100644
+--- a/crates/agent_ui/src/agent_diff.rs
++++ b/crates/agent_ui/src/agent_diff.rs
+@@ -1484,6 +1484,7 @@ impl AgentDiff {
+             AcpThreadEvent::TitleUpdated
+             | AcpThreadEvent::StatusChanged
+             | AcpThreadEvent::TokenUsageUpdated
++            | AcpThreadEvent::AccountUsageUpdated
+             | AcpThreadEvent::SubagentSpawned(_)
+             | AcpThreadEvent::EntriesRemoved(_)
+             | AcpThreadEvent::ToolAuthorizationRequested(_)
+diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
+index fe676fa..78b5333 100644
+--- a/crates/agent_ui/src/conversation_view.rs
++++ b/crates/agent_ui/src/conversation_view.rs
+@@ -324,6 +324,7 @@ impl Conversation {
+                     | AcpThreadEvent::StatusChanged
+                     | AcpThreadEvent::TitleUpdated
+                     | AcpThreadEvent::TokenUsageUpdated
++                    | AcpThreadEvent::AccountUsageUpdated
+                     | AcpThreadEvent::EntryUpdated(_)
+                     | AcpThreadEvent::EntriesRemoved(_)
+                     | AcpThreadEvent::Retry(_)
+@@ -586,6 +587,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
+         | AcpThreadEvent::EntriesRemoved(_)
+         | AcpThreadEvent::Retry(_)
+         | AcpThreadEvent::TokenUsageUpdated
++        | AcpThreadEvent::AccountUsageUpdated
+         | AcpThreadEvent::PromptCapabilitiesUpdated
+         | AcpThreadEvent::AvailableCommandsUpdated(_)
+         | AcpThreadEvent::ModeUpdated(_)
+@@ -1832,6 +1834,13 @@ impl ConversationView {
+                     });
+                 }
+             }
++            AcpThreadEvent::AccountUsageUpdated => {
++                // A redraw is all this needs: the account section is built from the thread
++                // when the tooltip opens, so there is no per-turn state to recompute.
++                if let Some(active) = self.thread_view(&session_id) {
++                    active.update(cx, |_, cx| cx.notify());
++                }
++            }
+             AcpThreadEvent::AvailableCommandsUpdated(available_commands) => {
+                 if let Some(thread_view) = self.thread_view(&session_id) {
+                     let available_skills = thread
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index ce9a342..d2433f8 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -9,8 +9,9 @@ use agent_client_protocol::schema::v1 as acp;
+ use std::cell::RefCell;
+ 
+ use acp_thread::{
+-    Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
+-    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, decode_path_escapes,
++    AccountUsageStatus, Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry,
++    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
++    decode_path_escapes,
+ };
+ use agent::{
+     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
+@@ -4750,6 +4751,32 @@ impl ThreadView {
+             crate::humanize_token_count(usage.max_tokens.saturating_sub(max_output_tokens));
+         let output_max_label = crate::humanize_token_count(max_output_tokens);
+ 
++        // Account quota, when the agent reports it. Only the Claude adapter does today: it
++        // forwards the SDK's `rate_limit_event` in `_meta`, which ACP itself has no field
++        // for. Every other agent yields an empty vec and the section does not render.
++        let (account_rows, account_credits_required) = match thread.account_usage() {
++            Some(account) => (
++                account
++                    .windows()
++                    .map(|window| {
++                        let ratio = window.utilization.unwrap_or(0.0);
++                        AccountUsageRow {
++                            label: window.kind.label().into(),
++                            percentage: window
++                                .utilization
++                                .map(|u| format!("{}%", (u * 100.0).round() as u32))
++                                .unwrap_or_else(|| "—".to_string())
++                                .into(),
++                            ratio,
++                            elevated: !matches!(window.status, AccountUsageStatus::Allowed),
++                        }
++                    })
++                    .collect::<Vec<_>>(),
++                account.credits_required,
++            ),
++            None => (Vec::new(), false),
++        };
++
+         let build_tooltip = {
+             move |_window: &mut Window, cx: &mut App| {
+                 let percentage = percentage.clone();
+@@ -4762,8 +4789,11 @@ impl ThreadView {
+                 let project_entry_ids = project_entry_ids.clone();
+                 let workspace = workspace.clone();
+                 let cost_label = cost_label.clone();
++                let account_rows = account_rows.clone();
+                 cx.new(move |_cx| TokenUsageTooltip {
+                     percentage,
++                    account_rows,
++                    account_credits_required,
+                     used,
+                     max,
+                     input_tokens: input_tokens_label,
+@@ -5751,8 +5781,23 @@ impl ThreadView {
+     }
+ }
+ 
++/// One account quota row in the context tooltip: the label, how full it is, and whether
++/// the agent flagged it as warning/rejected.
++///
++/// Built in `render_token_usage` and passed by value, because the tooltip is constructed in
++/// a closure that outlives the borrow of the thread.
++#[derive(Clone)]
++struct AccountUsageRow {
++    label: SharedString,
++    percentage: SharedString,
++    ratio: f32,
++    elevated: bool,
++}
++
+ struct TokenUsageTooltip {
+     percentage: String,
++    account_rows: Vec<AccountUsageRow>,
++    account_credits_required: bool,
+     used: String,
+     max: String,
+     input_tokens: String,
+@@ -5780,6 +5825,8 @@ impl Render for TokenUsageTooltip {
+         let output_max = self.output_max.clone();
+         let show_split = self.show_split;
+         let cost_label = self.cost_label.clone();
++        let account_rows = self.account_rows.clone();
++        let account_credits_required = self.account_credits_required;
+         let global_agents_md_loaded = self.global_agents_md_loaded;
+         let project_rules_count = self.project_rules_count;
+         let project_entry_ids = self.project_entry_ids.clone();
+@@ -5842,6 +5889,68 @@ impl Render for TokenUsageTooltip {
+                             .child(Label::new(cost_label)),
+                     )
+                 })
++                .when(
++                    !account_rows.is_empty() || account_credits_required,
++                    |this| {
++                        this.child(
++                            v_flex()
++                                .mt_1p5()
++                                .pt_1p5()
++                                .gap_1()
++                                .border_t_1()
++                                .border_color(cx.theme().colors().border_variant)
++                                .child(
++                                    Label::new("Account")
++                                        .color(Color::Muted)
++                                        .size(LabelSize::Small),
++                                )
++                                .children(account_rows.into_iter().map(|row| {
++                                    let fill = if row.elevated {
++                                        cx.theme().status().warning
++                                    } else {
++                                        cx.theme().colors().text_muted
++                                    };
++                                    v_flex()
++                                        .gap_0p5()
++                                        .child(
++                                            h_flex()
++                                                .justify_between()
++                                                .gap_2()
++                                                .child(
++                                                    Label::new(row.label)
++                                                        .size(LabelSize::Small)
++                                                        .color(Color::Muted),
++                                                )
++                                                .child(
++                                                    Label::new(row.percentage)
++                                                        .size(LabelSize::Small),
++                                                ),
++                                        )
++                                        .child(
++                                            div()
++                                                .w_full()
++                                                .h(px(3.))
++                                                .rounded_full()
++                                                .bg(cx.theme().colors().element_background)
++                                                .child(
++                                                    div()
++                                                        .h_full()
++                                                        .w(relative(row.ratio))
++                                                        .rounded_full()
++                                                        .bg(fill),
++                                                ),
++                                        )
++                                }))
++                                .when(account_credits_required, |this| {
++                                    this.child(
++                                        Label::new("Usage credits required to continue")
++                                            .size(LabelSize::Small)
++                                            .color(Color::Warning),
++                                    )
++                                }),
++                        )
++                    },
++                )
+                 .when(
+                     global_agents_md_loaded || project_rules_count > 0,
+                     move |this| {
+-- 
+2.55.0
+
