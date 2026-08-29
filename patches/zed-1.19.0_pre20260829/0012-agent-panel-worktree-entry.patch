@@ -1,0 +1,70 @@
+From 195054aabc5fd81dcfa742e2d1b533af91b080c7 Mon Sep 17 00:00:00 2001
+From: lucascouts <diego.evangelista5642@gmail.com>
+Date: Sat, 29 Aug 2026 20:42:19 -0300
+Subject: [PATCH] feat(agent_ui): reach the worktree picker from the agent
+ panel
+
+The agent panel can already open a git worktree, but only on the model's behalf.
+`create_thread_tool` sets `use_new_worktree` on its request and this file builds
+a `zed_actions::CreateWorktree` from it -- and that field is reachable from
+nowhere else. So the agent gets an isolated tree when it asks for one, and the
+human looking at the same panel cannot: neither of the panel's two menus carries
+a worktree entry, and the picker is otherwise reachable only from the title bar
+(which the panel does not own, and which hides the button unless
+`show_worktree_name` is on) or from a keybinding nobody finds by looking.
+
+Add one entry to the panel's options menu, dispatching the zero-arg
+`zed_actions::git::Worktree`.
+
+Three things it deliberately does not do:
+
+  * It declares no action and registers no handler. `git::Worktree` already
+    exists in `zed_actions`, and `git_ui` already registers it on `Workspace`
+    (`git_ui.rs`), which is an ancestor of the panel in the dispatch chain --
+    exactly how the neighbouring "Toggle Threads Sidebar" entry reaches its own
+    handler. A second registration would be a second answer to one question.
+
+  * It does not dispatch `git::CreateWorktree`. The zero-arg action opens the
+    picker, and the picker is what decides between creating a worktree and
+    switching to an existing one. Constructing `CreateWorktree` in a menu would
+    bypass that decision and hardcode one branch of it.
+
+  * It does not gate on the project having a git repository. The action is bound
+    globally (`alt-ctrl-shift-w` and its per-platform equivalents), so the picker
+    already has to answer for a project without one; a gate here would put a
+    second, weaker answer in `agent_ui` and couple the panel's render path to git
+    state it otherwise never reads.
+
+The entry sits beside "Toggle Threads Sidebar" rather than in the new-thread
+menu. Every entry in that menu starts a thread with a chosen agent; this one
+starts no thread at all, and putting it there would promise one. Here its
+neighbours are the panel's other workspace-scoped entries, and the block is
+unconditional, so the entry is present in terminal mode too. `ContextMenu::action`
+renders the action's existing keybinding beside the label, which is most of the
+discoverability this is for.
+---
+ crates/agent_ui/src/agent_panel.rs | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/crates/agent_ui/src/agent_panel.rs b/crates/agent_ui/src/agent_panel.rs
+index 9435b3b..70fc53c 100644
+--- a/crates/agent_ui/src/agent_panel.rs
++++ b/crates/agent_ui/src/agent_panel.rs
+@@ -5772,9 +5772,14 @@ impl AgentPanel {
+                                 .action("Profiles", Box::new(ManageProfiles::default()));
+                         }
+ 
++                        // The zero-arg action opens the picker, which is what
++                        // chooses between creating a worktree and switching to
++                        // one; `git_ui` registers its handler on the workspace.
++                        // Path-qualified because `Worktree` here is `project`'s.
+                         menu = menu
+                             .action("Settings", Box::new(OpenSettings))
+                             .separator()
++                            .action("Worktrees", Box::new(zed_actions::git::Worktree))
+                             .action("Toggle Threads Sidebar", Box::new(ToggleWorkspaceSidebar));
+ 
+                         if has_auth_methods || supports_logout {
+-- 
+2.55.0
+
