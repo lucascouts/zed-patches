@@ -61,6 +61,15 @@ assert_equal() {
 	return 0
 }
 
+assert_not_contains() {
+	local haystack="$1" needle="$2"
+	[[ "${haystack}" != *"${needle}"* ]] || {
+		no "output must NOT mention: ${needle}"
+		return 1
+	}
+	return 0
+}
+
 # tree_checksum <dir> — content digest of a tree, independent of where it lives.
 # sha256sum prints the path next to each hash, so this must run from inside the
 # directory: with absolute paths two identical trees in different temp dirs would
@@ -815,6 +824,277 @@ test_refresh_stops_on_conflict() {
 	rm -rf "${tmp}"
 }
 
+# --- lib.sh: the advisory step (task 2.3 — R2.4…R2.8) -----------------------
+#
+# Authored test-first, from the requirements alone. The helper under test does not
+# exist yet; these cases describe what it must answer, never how.
+#
+#   report_advisories [--offline]
+#     scans the chain's lockfiles — the four npm ones plus the packaged Zed's
+#     Cargo.lock at ${ZP_WORKTREE} — and PRINTS one of four verdicts per file:
+#     clean · findings · scan failed · skipped. It ALWAYS returns 0: R2.8 forbids
+#     it changing any caller's exit code, and every caller runs under
+#     `set -euo pipefail`, where a non-zero return would abort the whole run.
+#     The chain root is ZP_CHAIN_ROOT (the ZP_* override convention lib.sh
+#     already follows for ZP_REPO / ZP_OVERLAY / ZP_DISTDIR / ZP_WORKROOT).
+#
+# The scanner is stubbed ON PATH, never behind a flag: status.sh parses its
+# arguments positionally and exits 2 on anything it does not recognise.
+#
+# `clean` is asserted in its own case on purpose. R2.6 asks for `scan failed` to be
+# DISTINCT from clean, and a distinction cannot be proved from one side: without the
+# clean fixture, a helper that prints "scan failed" for every run would pass.
+
+# make_chain <dir> — the five lockfiles the advisory step reads (D2), each with
+# enough content to be a plausible input. The Cargo.lock sits where the packaged
+# tree does, under a work/ that CLAUDE.md calls disposable by design.
+make_chain() {
+	local root="$1"
+	mkdir -p "${root}/claude-agent-fork/fork" \
+		"${root}/claude-agent-fork/claude-agent-acp-plus" \
+		"${root}/claude-agent-tui/fork" \
+		"${root}/claude-agent-tui/claude-agent-tui" \
+		"${root}/zed-patches/work/zed-${FIXTURE_COMMIT}"
+	printf '{"lockfileVersion":3,"packages":{}}\n' >"${root}/claude-agent-fork/fork/package-lock.json"
+	printf '{"lockfileVersion":3,"packages":{}}\n' >"${root}/claude-agent-fork/claude-agent-acp-plus/package-lock.json"
+	printf '{"lockfileVersion":3,"packages":{}}\n' >"${root}/claude-agent-tui/fork/package-lock.json"
+	printf '{"lockfileVersion":3,"packages":{}}\n' >"${root}/claude-agent-tui/claude-agent-tui/package-lock.json"
+	printf 'version = 4\n' >"${root}/zed-patches/work/zed-${FIXTURE_COMMIT}/Cargo.lock"
+}
+
+# make_scanner <bindir> <exit-status> <stdout…> — an osv-scanner stub, first on
+# PATH. It ignores its arguments: what the helper passes is its business, what it
+# does with the answer is what these cases are about. Every call is recorded, so
+# a case can assert the scanner was NOT run.
+make_scanner() {
+	local bindir="$1" status="$2" out="$3"
+	mkdir -p "${bindir}"
+	{
+		echo '#!/usr/bin/env bash'
+		# shellcheck disable=SC2016,SC2028  # the stub's body, written verbatim; it must not expand here
+		echo 'printf "%s\n" "$*" >>"${SCANNER_CALLS:-/dev/null}"'
+		printf 'printf %s\\\\n %q\n' '%s' "${out}"
+		echo "exit ${status}"
+	} >"${bindir}/osv-scanner"
+	chmod +x "${bindir}/osv-scanner"
+}
+
+# run_advisories <chain> <bindir|-> [args…] — call the helper the way both callers
+# will: from a `set -euo pipefail` shell, printing its own return status after it.
+# `-` for <bindir> means a PATH with no osv-scanner on it at all.
+run_advisories() {
+	local chain="$1" bindir="$2"
+	shift 2
+	local path
+	if [[ "${bindir}" == "-" ]]; then
+		mkdir -p "${chain}/.empty-bin"
+		path="${chain}/.empty-bin"
+	else
+		path="${bindir}:${PATH}"
+	fi
+	PATH="${path}" \
+		SCANNER_CALLS="${chain}/.scanner-calls" \
+		ZP_CHAIN_ROOT="${chain}" \
+		ZP_WORKTREE="${chain}/zed-patches/work/zed-${FIXTURE_COMMIT}" \
+		"${BASH}" -c "set -euo pipefail; source '${SCRIPTS}/lib.sh'; report_advisories $*; printf 'rc=%s\n' \$?" 2>&1
+}
+
+test_advisory_skips_when_scanner_absent() {
+	case_start "advisory: no osv-scanner on PATH is reported as skipped, not as a failure"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	out="$(run_advisories "${tmp}/chain" "-")"
+	status=$?
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "skipped" &&
+		assert_not_contains "${out}" "scan failed" &&
+		assert_contains "${out}" "rc=0" && ok
+	rm -rf "${tmp}"
+}
+
+test_advisory_skips_when_offline() {
+	case_start "advisory: --offline skips without running the scanner (R2.5)"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	make_scanner "${tmp}/bin" 0 "no vulnerabilities found"
+	out="$(run_advisories "${tmp}/chain" "${tmp}/bin" --offline)"
+	status=$?
+	# Local-first: --offline must not merely discard the answer, it must not ask.
+	{ [[ ! -s "${tmp}/chain/.scanner-calls" ]] || {
+		no "the scanner was invoked despite --offline"
+		false
+	}; } &&
+		assert_status 0 "${status}" &&
+		assert_contains "${out}" "skipped" &&
+		assert_contains "${out}" "rc=0" && ok
+	rm -rf "${tmp}"
+}
+
+test_advisory_reports_clean() {
+	case_start "advisory: a scanner that finds nothing is reported clean"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	make_scanner "${tmp}/bin" 0 "no vulnerabilities found"
+	out="$(run_advisories "${tmp}/chain" "${tmp}/bin")"
+	status=$?
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "clean" &&
+		assert_not_contains "${out}" "scan failed" &&
+		assert_contains "${out}" "rc=0" && ok
+	rm -rf "${tmp}"
+}
+
+test_advisory_reports_findings_without_touching_the_exit_code() {
+	case_start "advisory: findings are shown and the caller's status is untouched (R2.4, R2.8)"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	# osv-scanner exits non-zero for findings — the same way it exits non-zero
+	# when it breaks, which is why a blanket `|| true` cannot tell them apart.
+	make_scanner "${tmp}/bin" 1 "GHSA-1234-5678-9abc: prototype pollution in left-pad"
+	out="$(run_advisories "${tmp}/chain" "${tmp}/bin")"
+	status=$?
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "findings" &&
+		assert_contains "${out}" "GHSA-1234-5678-9abc" &&
+		assert_contains "${out}" "rc=0" && ok
+	rm -rf "${tmp}"
+}
+
+test_advisory_reports_scan_failure_distinctly_from_clean() {
+	case_start "advisory: a non-zero exit with no report is 'scan failed', not 'clean' (R2.6)"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	# The case that matters most: the scanner broke. It exits non-zero and says
+	# nothing — indistinguishable from a clean run to anything that only reads
+	# the status, and indistinguishable from findings to anything that only reads
+	# the non-zero.
+	make_scanner "${tmp}/bin" 127 ""
+	out="$(run_advisories "${tmp}/chain" "${tmp}/bin")"
+	status=$?
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "scan failed" &&
+		assert_not_contains "${out}" "clean" &&
+		assert_contains "${out}" "rc=0" && ok
+	rm -rf "${tmp}"
+}
+
+test_advisory_skips_only_the_missing_lockfile() {
+	case_start "advisory: a lockfile that is not there is skipped for that file alone (R2.7)"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	# work/ is disposable by design, so the packaged Cargo.lock is routinely
+	# absent. That is a skip for one file, never a failed step.
+	rm -f "${tmp}/chain/zed-patches/work/zed-${FIXTURE_COMMIT}/Cargo.lock"
+	make_scanner "${tmp}/bin" 0 "no vulnerabilities found"
+	out="$(run_advisories "${tmp}/chain" "${tmp}/bin")"
+	status=$?
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "Cargo.lock" &&
+		assert_contains "${out}" "skipped" &&
+		assert_not_contains "${out}" "scan failed" &&
+		assert_contains "${out}" "claude-agent-acp-plus" &&
+		assert_contains "${out}" "rc=0" && ok
+	rm -rf "${tmp}"
+}
+
+# --- status.sh / bump.sh: the advisory step in the caller's own body (task 2.4)
+#
+# Task 2.3's six cases call report_advisories directly, so they say nothing about
+# WHERE it is called from: a helper that is perfectly correct but wired into one
+# of the delegated `bash "${SCRIPTS}/…"` sub-shells passes all six of them. This
+# case is the one that cannot be satisfied that way. It runs the REAL
+# scripts/status.sh end to end and asserts the advisory verdict reaches THAT
+# script's own output, ahead of its first gated step (R2.9) — and status.sh
+# captures every delegated run into a variable, printing only the lines it
+# chooses to and only after the 'packaged zed' header, so output produced inside
+# a sub-shell can never land ahead of it.
+#
+# bump.sh cannot be run end to end here: its first step regenerates a patch
+# series against a prepared tree, which is a Rust checkout this harness has no
+# business building. Its half of R2.9 is therefore read from the script itself —
+# a top-level `report_advisories` call standing before `step '1/4 …'`.
+#
+# Nothing real is touched: a fixture overlay holding one ebuild (never the
+# machine's), a temporary DISTDIR and WORKROOT, and two stubs first on PATH.
+# Stubs on PATH rather than a flag because status.sh parses its arguments
+# positionally and exits 2 on anything it does not recognise; npm is stubbed for
+# the same reason the rest of this file never reaches the network — the registry
+# lookups status.sh performs online are answered locally instead.
+#
+# The fixture overlay is also what makes the exit code deterministic rather than
+# a property of this machine: check-sync.sh finds no series for the fixture
+# version, so status.sh reports drift and exits 1 whether or not the advisory
+# step is there. R2.8 is that it STAYS 1 — measured from the run itself, never
+# through a pipe, which would report the pipeline's status instead.
+
+# make_npm <bindir> <version> — an npm stub answering `npm view <pkg> version`,
+# so the online path of status.sh needs no registry.
+make_npm() {
+	local bindir="$1" version="$2"
+	mkdir -p "${bindir}"
+	{
+		echo '#!/usr/bin/env bash'
+		printf 'printf %s\\\\n %q\n' '%s' "${version}"
+	} >"${bindir}/npm"
+	chmod +x "${bindir}/npm"
+}
+
+test_status_calls_the_advisory_step_in_its_own_body() {
+	case_start "callers: status.sh reports advisories from its own body ahead of step 1, its exit code unchanged (R2.8, R2.9, R2.10)"
+	local tmp out status chain_root status_sh bump_sh header before adv_line step_line
+	chain_root="$(cd "${REPO_ROOT}/.." && pwd)"
+	status_sh="${chain_root}/scripts/status.sh"
+	bump_sh="${SCRIPTS}/bump.sh"
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
+	make_scanner "${tmp}/bin" 1 "GHSA-1234-5678-9abc: prototype pollution in left-pad"
+	make_npm "${tmp}/bin" "0.0.0-stub"
+
+	out="$(PATH="${tmp}/bin:${PATH}" \
+		SCANNER_CALLS="${tmp}/chain/.scanner-calls" \
+		ZP_CHAIN_ROOT="${tmp}/chain" \
+		ZP_OVERLAY="${tmp}/overlay" \
+		ZP_DISTDIR="${tmp}/dist" \
+		ZP_WORKROOT="${tmp}/work" \
+		bash "${status_sh}" 2>&1)"
+	status=$?
+
+	header='packaged zed'
+	before="${out%%${header}*}"
+	adv_line="$(grep -n '^[[:space:]]*report_advisories' "${bump_sh}" | head -1 | cut -d: -f1)"
+	step_line="$(grep -n "1/4" "${bump_sh}" | head -1 | cut -d: -f1)"
+
+	assert_status 1 "${status}" &&
+		assert_contains "${out}" "${header}" &&
+		assert_contains "${out}" "findings" &&
+		assert_contains "${out}" "GHSA-1234-5678-9abc" &&
+		{ [[ -s "${tmp}/chain/.scanner-calls" ]] || {
+			no "status.sh never invoked the scanner — the advisory step did not run"
+			false
+		}; } &&
+		{ [[ "${before}" == *"GHSA-1234-5678-9abc"* ]] || {
+			no "the advisory output did not reach status.sh's own body ahead of '${header}' — output from inside a delegated sub-shell looks exactly like this"
+			false
+		}; } &&
+		{ [[ -n "${adv_line}" && -n "${step_line}" && "${adv_line}" -lt "${step_line}" ]] || {
+			no "bump.sh has no top-level report_advisories call standing before step 1/4 (found at line [${adv_line:-none}], step 1/4 at [${step_line:-none}])"
+			false
+		}; } &&
+		{ [[ "$(sed -n '1,/^set -euo pipefail/p' "${status_sh}")" == *advisor* &&
+			"$(sed -n '1,/^set -euo pipefail/p' "${bump_sh}")" == *advisor* ]] || {
+			no "the header comment of status.sh and bump.sh must describe the advisory step and what it does to the exit code (R2.10)"
+			false
+		}; } && ok
+	rm -rf "${tmp}"
+}
+
 # --- runner -----------------------------------------------------------------
 
 main() {
@@ -866,6 +1146,15 @@ main() {
 	test_refresh_preserves_source_set
 	test_refresh_refuses_existing_destination
 	test_refresh_stops_on_conflict
+
+	test_advisory_skips_when_scanner_absent
+	test_advisory_skips_when_offline
+	test_advisory_reports_clean
+	test_advisory_reports_findings_without_touching_the_exit_code
+	test_advisory_reports_scan_failure_distinctly_from_clean
+	test_advisory_skips_only_the_missing_lockfile
+
+	test_status_calls_the_advisory_step_in_its_own_body
 
 	printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
 	[[ "${FAIL}" -eq 0 ]]

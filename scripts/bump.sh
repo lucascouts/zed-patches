@@ -10,6 +10,14 @@
 #   3. sync         copy it into the overlay's files/
 #   4. check-sync   confirm all three relations agree afterwards
 #
+# Ahead of all four runs the advisory step: the chain's lockfiles read against
+# the OSV database. Its place is first on purpose. Every exit this script can
+# take from step 1 onwards -- the one success and all five failures -- lies
+# below it, so it is the part of the run that reports whatever else happens,
+# including on the bump that stopped early. That is precisely the run where a
+# known vulnerability in what is about to ship matters most. It gates nothing,
+# nothing gates it, and it NEVER moves the exit code.
+#
 # Without --apply, step 3 is a dry run: the run reports what would be copied and
 # writes nothing to the overlay. Step 1 does write, but only inside this
 # repository, where git can undo it.
@@ -24,6 +32,7 @@
 # ebuild, --from as the newest series already in patches/ that is not --to.
 #
 # Exit: 0 bumped · 1 a step failed or a decision is waiting · 2 environment problem.
+# The advisory step contributes to none of the three.
 
 set -euo pipefail
 
@@ -94,6 +103,18 @@ if [[ -d "${repo}/patches/${to}" ]]; then
 else
 	skip_refresh="no"
 fi
+
+# --- advisories --------------------------------------------------------------
+
+# Called from this script's own body, and before the first delegated run rather
+# than from inside one of them. The `bash "${SCRIPTS}/..."` steps below are
+# gated -- each only runs once the one before it succeeded -- so a check placed
+# inside any of them would inherit that gating and go missing on exactly the
+# failed bump it exists to speak up on.
+#
+# shellcheck disable=SC2119  # the helper's one argument is --offline, and this
+# script has no such flag; forwarding "$@" would hand it --from/--to/--apply.
+report_advisories
 
 # --- 1. refresh --------------------------------------------------------------
 
