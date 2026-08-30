@@ -1,5 +1,9 @@
-# Apply order and USE-flag grouping, mirroring src_prepare() in
-# app-editors/zed/zed-1.19.0_pre20260826-r1.ebuild.
+# Apply order and USE-flag grouping, mirroring src_prepare() in the overlay's
+# single app-editors/zed ebuild -- resolved, never named. An overlay autoupdate
+# bumps that ebuild most days, so a version written here is stale before anyone
+# reads it; this header said zed-1.19.0_pre20260826-r1 while the tree packaged
+# 1.19.0_pre20260829, three bumps later. `resolve_version` in scripts/lib.sh is
+# how the tooling finds it.
 
 # @feature: claude-agent-acp-plus
 0001-force-enable-claude-agent-acp-plus.patch
@@ -28,6 +32,14 @@
 # dependency, not by choice: no other agent sends that key, so without the
 # adapter the section never renders.
 0011-account-usage-panel.patch
+# 0012: a "Worktrees" entry in the agent panel's menu, dispatching the existing
+# zero-argument zed_actions::git::Worktree so the picker decides between creating
+# a worktree and switching to one. Zed already ships the capability end to end and
+# the panel already reaches it -- but only under request.use_new_worktree, which is
+# an input of the create_thread AGENT TOOL, so the model could open a worktree and
+# the person looking at the same panel could not. It applies to the packaged source
+# on its own, so like 0010 it rides this flag by choice rather than by dependency:
+# nothing about a worktree needs the adapter.
 0012-agent-panel-worktree-entry.patch
 
 # @feature: claude-code-ide
