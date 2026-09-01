@@ -1,0 +1,46 @@
+# Apply order and USE-flag grouping, mirroring src_prepare() in the overlay's
+# single app-editors/zed ebuild -- resolved, never named. An overlay autoupdate
+# bumps that ebuild most days, so a version written here is stale before anyone
+# reads it; this header said zed-1.19.0_pre20260826-r1 while the tree packaged
+# 1.19.0_pre20260829, three bumps later. `resolve_version` in scripts/lib.sh is
+# how the tooling finds it.
+
+# @feature: claude-agent-acp-plus
+0001-force-enable-claude-agent-acp-plus.patch
+# 0003/0004 (per-option _meta description + preview) retired: upstream 950ec79
+# surfaces option descriptions natively via the ACP EnumOption.description
+# field, superseding the _claude/askUserQuestionOption _meta machinery (and
+# renamed MultiSelectItems::Untitled -> String). The numbers stay retired so
+# the remaining filenames keep matching the ebuild's PATCHES+=() lines.
+0005-elicitation-multiline-fields.patch
+0006-elicitation-option-previews.patch
+0007-manual-mode-badge.patch
+0008-clickable-attachments.patch
+# 0009: adopt the agent's config-option response when applying per-agent
+# defaults, so options that appear as a side effect (Fast mode once the
+# resolved model supports it) surface without a manual model switch.
+0009-Adopt-agent-s-config-option-response-when-applying-d.patch
+# 0010: a thread menu choice (permission mode, model, thinking effort, an ACP
+# agent's config options) applies to that thread only; Shift also makes it the
+# default for new threads. It applies to the packaged source on its own, so it
+# rides this flag by choice rather than by dependency -- it also covers the
+# native agent's own menus, which this flag otherwise has nothing to do with.
+0010-shift-to-set-as-default.patch
+# 0011: an "Account" section in the context tooltip, showing the account quota
+# windows (5-hour, weekly, per-model) the adapter already forwards under
+# _meta["_claude/rateLimit"] and Zed previously discarded. It rides this flag by
+# dependency, not by choice: no other agent sends that key, so without the
+# adapter the section never renders.
+0011-account-usage-panel.patch
+# 0012: a "Worktrees" entry in the agent panel's menu, dispatching the existing
+# zero-argument zed_actions::git::Worktree so the picker decides between creating
+# a worktree and switching to one. Zed already ships the capability end to end and
+# the panel already reaches it -- but only under request.use_new_worktree, which is
+# an input of the create_thread AGENT TOOL, so the model could open a worktree and
+# the person looking at the same panel could not. It applies to the packaged source
+# on its own, so like 0010 it rides this flag by choice rather than by dependency:
+# nothing about a worktree needs the adapter.
+0012-agent-panel-worktree-entry.patch
+
+# @feature: claude-code-ide
+0002-claude-code-ide-integration.patch
