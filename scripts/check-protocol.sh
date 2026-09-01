@@ -32,11 +32,19 @@ set -euo pipefail
 
 readonly EXPECT_PARSER='return{workspaceFolders:'
 readonly EXPECT_FIELD='useWebSocket'
-readonly EXPECT_TRANSPORT='if(u.useWebSocket)K=`ws://'
+# The one clause that is a code shape rather than a protocol literal, and so the
+# one that must be a pattern. The bundler renames the identifiers around it on
+# every release -- `u` and `K` in 2.1.252 were `c` and `N` in 2.1.257 -- while the
+# field name, the branch and the scheme it selects are the protocol and do not
+# move. Pinning the identifiers produced a false DRIFT on the first CLI bump
+# after this script was written.
+readonly EXPECT_TRANSPORT='if\([a-zA-Z_$]+\.useWebSocket\)[a-zA-Z_$]+=`ws://'
 readonly EXPECT_SUBPROTOCOL='protocols:["mcp"]'
 readonly EXPECT_AUTH_HEADER='X-Claude-Code-Ide-Authorization'
 
-# Derived against claude 2.1.251 on 2026-08-29; re-confirmed unchanged on 2.1.252.
+# Derived against claude 2.1.251 on 2026-08-29. Unchanged in 2.1.252 and 2.1.257 --
+# the only thing that moved across those releases was minified naming, which is
+# why exactly one clause below is a pattern and the rest are literals.
 readonly DERIVED_AGAINST='2.1.251'
 
 drift=0
@@ -70,6 +78,19 @@ expect() {
 	fi
 }
 
+# expect_pattern <ere> <description> -- the same, for a clause that can only be
+# matched by shape. Kept separate from expect() so every fixed string stays a
+# fixed string: escaping four literals into regexes to share one function would
+# trade a real risk of a mis-escaped anchor for no gain.
+expect_pattern() {
+	local pattern="$1" description="$2"
+	if grep -qE -- "${pattern}" "${strings_file}"; then
+		ok "${description}"
+	else
+		bad "${description} -- nothing in the CLI matches /${pattern}/"
+	fi
+}
+
 check_cli() {
 	local cli resolved
 	cli="$(command -v claude 2>/dev/null || true)"
@@ -93,7 +114,7 @@ check_cli() {
 
 	expect "${EXPECT_PARSER}" 'lock file is still parsed field-by-field'
 	expect "${EXPECT_FIELD}" "lock file is still read for '${EXPECT_FIELD}'"
-	expect "${EXPECT_TRANSPORT}" 'useWebSocket still selects the ws:// URL'
+	expect_pattern "${EXPECT_TRANSPORT}" 'useWebSocket still selects the ws:// URL'
 	expect "${EXPECT_SUBPROTOCOL}" 'the CLI still offers the mcp subprotocol'
 	expect "${EXPECT_AUTH_HEADER}" 'the auth header name is unchanged'
 
