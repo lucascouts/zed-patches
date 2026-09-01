@@ -1,3 +1,69 @@
+From 4f210c6f8bd638dc4ca6007d43addf26444c7392 Mon Sep 17 00:00:00 2001
+From: zed-patches <zed-patches@localhost>
+Date: Tue, 1 Sep 2026 11:55:36 -0300
+Subject: [PATCH] feat(claude_code_ide): serve the Claude Code IDE protocol on
+ a loopback WebSocket
+
+Creates crates/claude_code_ide/ and wires it into crates/project and crates/zed,
+so the `claude` CLI running in Zed's integrated terminal connects to the editor
+the way it does to VS Code and JetBrains: `/ide` finds a server, selections and
+diagnostics flow, and a proposed change opens as a real diff tab with Keep and
+Reject rather than as a wall of text in the terminal.
+
+Shape. One server per workspace window, bound to 127.0.0.1:0. Each writes
+~/.claude/ide/<port>.lock (0600 in a 0700 directory, atomically, so the CLI never
+reads a half-written file) carrying a per-window random token, and the terminal
+gets CLAUDE_CODE_SSE_PORT and ENABLE_IDE_INTEGRATION so the CLI auto-connects.
+The trust boundary is processes running as this user, which is what the official
+editor integrations assume too.
+
+`openDiff` blocks until the user decides and then returns the accepted contents;
+it deliberately does not write the file, because the CLI performs that write and
+doing both would race.
+
+The protocol this speaks is defined by the CLI and documented nowhere, so two
+clauses are worth naming here -- both were wrong in this patch's first version,
+and both fail silently:
+
+  - The lock file must carry `useWebSocket: true`. The CLI branches on that field
+    alone; `transport: "ws"` is never read, and without the boolean the CLI
+    builds http://host:port/sse and reaches nothing. Note serde's camelCase
+    renders `use_websocket` as `useWebsocket`, with a lowercase `s`, which the
+    CLI also ignores -- hence the explicit #[serde(rename)].
+  - The handshake must echo `Sec-WebSocket-Protocol: mcp`. The CLI offers it on
+    every connection and its WebSocket client closes with 1002, "Missing client
+    protocol", when the 101 does not name it back.
+
+Neither breaks the build, so neither is caught by anything that checks whether
+this patch still applies. zed-patches/scripts/check-protocol.sh is what watches
+them, and terminal-ide/CLAUDE.md records how to re-derive them from the shipped
+CLI when it next moves.
+
+Upstream PR #58300 was closed unmerged on 2026-06-30. Discussion #58338 is where
+this work lives now, and where protocol breakage is reported first.
+---
+ Cargo.lock                                    |  26 +
+ Cargo.toml                                    |   2 +
+ crates/claude_code_ide/Cargo.toml             |  35 ++
+ crates/claude_code_ide/README.md              |  66 +++
+ crates/claude_code_ide/src/claude_code_ide.rs | 222 ++++++++
+ crates/claude_code_ide/src/lockfile.rs        | 166 ++++++
+ crates/claude_code_ide/src/open_diff.rs       | 219 ++++++++
+ crates/claude_code_ide/src/server.rs          | 484 +++++++++++++++++
+ crates/claude_code_ide/src/tools.rs           | 511 ++++++++++++++++++
+ crates/project/src/project.rs                 |  18 +
+ crates/project/src/terminals.rs               |  24 +
+ crates/zed/Cargo.toml                         |   1 +
+ crates/zed/src/main.rs                        |   1 +
+ 13 files changed, 1775 insertions(+)
+ create mode 100644 crates/claude_code_ide/Cargo.toml
+ create mode 100644 crates/claude_code_ide/README.md
+ create mode 100644 crates/claude_code_ide/src/claude_code_ide.rs
+ create mode 100644 crates/claude_code_ide/src/lockfile.rs
+ create mode 100644 crates/claude_code_ide/src/open_diff.rs
+ create mode 100644 crates/claude_code_ide/src/server.rs
+ create mode 100644 crates/claude_code_ide/src/tools.rs
+
 diff --git a/Cargo.lock b/Cargo.lock
 index 386fac6..c648c58 100644
 --- a/Cargo.lock
@@ -1937,3 +2003,6 @@ index c7e4eb6..974686d 100644
          edit_prediction_ui::init(cx);
          web_search::init(cx);
          web_search_providers::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+-- 
+2.55.0
+
