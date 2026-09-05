@@ -1,0 +1,42 @@
+# gitleaks config for the downstream Zed patch series.
+#
+# This repository versions patches, and a patch carries the lines it adds
+# verbatim. Patch 0002 (claude-code-ide-integration) adds a literal WebSocket
+# handshake so the ws-ide transport can be exercised by hand, and that handshake
+# contains a Sec-WebSocket-Key — a high-entropy base64 string, which is what
+# `generic-api-key` looks for.
+#
+# WITHOUT THIS FILE the repository reports ten findings, every one of them the
+# same value: two per copy of 0002, across the series directories kept for the
+# packaged versions, plus two in scripts/check-protocol.sh, which asserts the
+# same handshake. All ten are the same false positive counted repeatedly, and
+# a scanner that always reports ten is a scanner whose eleventh finding — the
+# real one — nobody reads.
+#
+# Keyed on the VALUE, never on a path, for the reason the orchestration repo's
+# own config gives: a path allowlist for the patches directory would also hide a
+# credential that landed in a patch tomorrow, and a patch is exactly the kind of
+# file into which one gets pasted by accident.
+[extend]
+useDefault = true
+
+[[rules]]
+# Placeholder so `[[rules]]` is not empty when extending; the default set is
+# what does the work.
+id = "zed-patches-noop"
+description = "unused — the default rule set is what scans"
+regex = '''\$^'''
+
+[allowlist]
+description = "RFC 6455 §1.3's own example Sec-WebSocket-Key (base64 of 'the sample nonce')"
+# A Sec-WebSocket-Key is a handshake nonce: sent in the clear, echoed back
+# hashed, public by construction. This particular one is the specification's own
+# sample value, which is why it appears in a test handshake rather than a
+# generated one — a fixed nonce makes the expected Sec-WebSocket-Accept fixed
+# too, so the exchange can be asserted without computing it.
+#
+# The same value is allowlisted, for the same reason and by the same means, in
+# the orchestration repository's .gitleaks.toml one directory up.
+regexes = [
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
+]
