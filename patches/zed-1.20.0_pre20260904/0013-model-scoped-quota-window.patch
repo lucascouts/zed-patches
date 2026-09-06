@@ -1,0 +1,378 @@
+From 6ad2a162fcd8f72b440a7066de52ea286a47dc17 Mon Sep 17 00:00:00 2001
+From: lucascouts <diego.evangelista5642@gmail.com>
+Date: Sat, 5 Sep 2026 20:47:25 -0300
+Subject: [PATCH] feat(acp_thread): render the model-scoped quota window with
+ the name the server sent
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The adapter has been emitting these and Zed has been dropping them. Every entry
+of `rate_limits.model_scoped[]` is forwarded under the single wire kind
+`"model_scoped"` (claude-agent-acp-plus, `account-usage.ts`), and
+`AccountUsageWindowKind::from_wire` had no arm for it, so the Fable row never
+reached the Account section `0011` added.
+
+**This adds a name; it does not open the enum.** `from_wire` still returns `None`
+for a kind it cannot name — `seven_day_oauth_apps`, which the adapter also
+forwards today, stays dropped, and there is a test pinning that. What makes
+`model_scoped` different is only that the server supplies the label: the new
+variant carries it, and a payload whose `displayName` is absent, non-string or
+blank is dropped exactly as an unknown kind is. `0011`'s drop-rather-than-guess
+rule is intact; it now has one more thing it can name.
+
+**The name is the identity, not decoration.** `AccountUsage::windows` is a
+`BTreeMap` keyed by the kind, so a display name held in a side field would make
+every model-scoped entry collide on one key and the second overwrite the first —
+several of them share the one `rateLimitType`, which is the adapter's own reason
+for saying "the display name and the number are the only things telling two of
+them apart". Carrying it inside the variant is what keeps two windows two.
+
+Stored verbatim: only blankness is judged. `"Fable"` and `"fable"` stay two
+windows, because normalising the key would silently drop one of two windows the
+server named separately.
+
+`label()` widens from `&'static str` to `SharedString` and the enum loses `Copy`,
+which a dynamic variant requires. Both are cheap here: the six static arms keep
+`new_static`, so they stay allocation-free, and `label()`'s only production
+consumer already stores a `SharedString` (`thread_view.rs`, `AccountUsageRow`).
+
+Known and deliberately not closed: a `displayName` can be chosen to render
+byte-identical to a static label — `"(Opus)"` renders `"Weekly (Opus)"`, which
+`SevenDayOpus` already spells. They remain two rows with two correct numbers and
+one repeated string. Every disambiguation that closes it distorts the label of an
+honestly-named window, so if the panel ever needs to tell them apart, the place
+for it is the renderer, not the key.
+
+Tests: eight cases in `acp_thread`'s test module, including the two hostile
+halves — two model-scoped windows must not collapse into one, and one window
+moving must not split into two — plus the guards that the unknown kind and the
+unnamed model-scoped window are still dropped.
+---
+ crates/acp_thread/src/acp_thread.rs | 245 +++++++++++++++++++++++++++-
+ 1 file changed, 236 insertions(+), 9 deletions(-)
+
+diff --git a/crates/acp_thread/src/acp_thread.rs b/crates/acp_thread/src/acp_thread.rs
+index 41af005..4686b00 100644
+--- a/crates/acp_thread/src/acp_thread.rs
++++ b/crates/acp_thread/src/acp_thread.rs
+@@ -2031,7 +2031,15 @@ pub struct SessionCost {
+ /// `rate_limit_event`. They are carried to us verbatim by the ACP adapter under
+ /// `_meta["_claude/rateLimit"]`; see [`AcpThread::account_usage`] for why we accumulate
+ /// them rather than replacing.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++///
++/// Every variant but [`Self::ModelScoped`] is a name this enum chose. That one is the
++/// exception the server earns by supplying a name of its own, and it is not an opening:
++/// an unrecognised `rateLimitType` is still dropped, and so is a model-scoped window
++/// that arrives without a usable name. See [`Self::from_wire`].
++///
++/// Not `Copy`: [`Self::ModelScoped`] owns its name. Cloning stays cheap — a
++/// [`SharedString`] is stored inline or refcounted, never re-allocated.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub enum AccountUsageWindowKind {
+     /// The rolling five-hour session window.
+     FiveHour,
+@@ -2041,6 +2049,19 @@ pub enum AccountUsageWindowKind {
+     SevenDayOpus,
+     /// The seven-day window for the Sonnet-class model specifically.
+     SevenDaySonnet,
++    /// A seven-day window for one model bucket, named by the server rather than here.
++    ///
++    /// The report's `limits.model_scoped[]` can hold any number of these and the adapter
++    /// forwards every one of them under the single `rateLimitType` `"model_scoped"`, so
++    /// the server-supplied `displayName` is the only thing telling two apart. It is
++    /// carried in the variant because it is part of the window's *identity*, not only of
++    /// its rendering: keyed by the wire kind alone, the second bucket would silently
++    /// overwrite the first.
++    ///
++    /// Held verbatim, exactly as the server spelled it. Any normalisation applied here
++    /// (case-folding, trimming) is this code deciding two names the server chose to keep
++    /// distinct are one window, which loses a row and the number on it.
++    ModelScoped(SharedString),
+     /// The seven-day window, counting overage the plan includes.
+     SevenDayOverageIncluded,
+     /// Paid overage beyond the plan's included usage.
+@@ -2048,7 +2069,14 @@ pub enum AccountUsageWindowKind {
+ }
+ 
+ impl AccountUsageWindowKind {
+-    fn from_wire(value: &str) -> Option<Self> {
++    /// The wire kind, plus the `displayName` beside it on the same payload.
++    ///
++    /// The rule is one rule, applied to both: **a window this code cannot name is
++    /// dropped.** A `rateLimitType` with no arm here has no name and is dropped; a
++    /// `model_scoped` payload whose `displayName` is missing, not a string, or blank has
++    /// no name either and is dropped by the same sentence. Adding a variant that carries
++    /// the server's name is not the same as accepting a value nobody can label.
++    fn from_wire(value: &str, display_name: Option<&str>) -> Option<Self> {
+         Some(match value {
+             "five_hour" => Self::FiveHour,
+             "seven_day" => Self::SevenDay,
+@@ -2056,22 +2084,42 @@ impl AccountUsageWindowKind {
+             "seven_day_sonnet" => Self::SevenDaySonnet,
+             "seven_day_overage_included" => Self::SevenDayOverageIncluded,
+             "overage" => Self::Overage,
++            "model_scoped" => Self::model_scoped(display_name)?,
+             // An unknown window is dropped rather than guessed: showing a quota bar
+             // under the wrong label is worse than showing one fewer bar.
+             _ => return None,
+         })
+     }
+ 
++    /// A model-scoped window under the name the server gave it, or `None` when it gave
++    /// none this row could be drawn under.
++    ///
++    /// Absent, not a string, or nothing but whitespace all mean the same thing: no name.
++    /// Rejecting the blank ones is not licence to rewrite the rest, so the name that does
++    /// survive is stored exactly as received — anything else folds two windows the server
++    /// named differently into one.
++    fn model_scoped(display_name: Option<&str>) -> Option<Self> {
++        let display_name = display_name?;
++        (!display_name.trim().is_empty()).then(|| Self::ModelScoped(display_name.into()))
++    }
++
+     /// A short label suitable for a usage row.
+-    pub fn label(self) -> &'static str {
+-        match self {
++    ///
++    /// A [`SharedString`] rather than a `&'static str`: [`Self::ModelScoped`]'s label is
++    /// built from a name only the server knows. Every other arm stays a static str.
++    pub fn label(&self) -> SharedString {
++        SharedString::new_static(match self {
+             Self::FiveHour => "Session (5h)",
+             Self::SevenDay => "Weekly",
+             Self::SevenDayOpus => "Weekly (Opus)",
+             Self::SevenDaySonnet => "Weekly (Sonnet)",
++            // The one label this enum does not spell. These buckets reset weekly like the
++            // ones around them, so the server's name is spelled to sit beside them; the
++            // name itself is passed through untouched.
++            Self::ModelScoped(name) => return format!("Weekly {name}").into(),
+             Self::SevenDayOverageIncluded => "Weekly (incl. overage)",
+             Self::Overage => "Overage",
+-        }
++        })
+     }
+ }
+ 
+@@ -2183,10 +2231,14 @@ impl AccountUsage {
+         // `rateLimitType` and `status` are both needed to place a bar. Without the kind we
+         // do not know which window moved; without the status we cannot colour it. Either
+         // one missing means this event carries only the account-wide flags handled above.
++        //
++        // `displayName` rides the same payload and names the model-scoped windows, which
++        // all share one `rateLimitType`; `from_wire` drops the ones it leaves unnamed.
++        let display_name = object.get("displayName").and_then(|v| v.as_str());
+         let Some(kind) = object
+             .get("rateLimitType")
+             .and_then(|v| v.as_str())
+-            .and_then(AccountUsageWindowKind::from_wire)
++            .and_then(|value| AccountUsageWindowKind::from_wire(value, display_name))
+         else {
+             return changed;
+         };
+@@ -2210,8 +2262,8 @@ impl AccountUsage {
+             resets_at: object.get("resetsAt").and_then(|v| v.as_i64()),
+         };
+ 
+-        if self.windows.get(&kind) != Some(&window) {
+-            self.windows.insert(kind, window);
++        if self.windows.get(&window.kind) != Some(&window) {
++            self.windows.insert(window.kind.clone(), window);
+             changed = true;
+         }
+         changed
+@@ -5008,7 +5060,7 @@ mod tests {
+         assert!(usage.ingest(&rate_limit("five_hour", "allowed", 0.25)));
+         assert!(usage.ingest(&rate_limit("seven_day", "allowed_warning", 0.9)));
+ 
+-        let kinds: Vec<_> = usage.windows().map(|w| w.kind).collect();
++        let kinds: Vec<_> = usage.windows().map(|w| w.kind.clone()).collect();
+         assert_eq!(
+             kinds,
+             vec![
+@@ -5105,6 +5157,181 @@ mod tests {
+             "a rejected window outranks a merely-full one"
+         );
+     }
++    fn model_scoped(display_name: &str, status: &str, utilization: f64) -> serde_json::Value {
++        serde_json::json!({
++            "status": status,
++            "rateLimitType": "model_scoped",
++            "displayName": display_name,
++            "utilization": utilization,
++            "resetsAt": 1_800_000_000i64,
++        })
++    }
++
++    #[test]
++    fn account_usage_renders_a_model_scoped_window_with_its_display_name() {
++        // The Fable row: the adapter emits it today and the closed enum drops it, so the
++        // panel silently omits a quota the account actually has.
++        let mut usage = AccountUsage::default();
++        assert!(
++            usage.ingest(&model_scoped("Fable", "allowed", 0.30)),
++            "a model-scoped window is a window the account has; folding it in changes what the panel must draw"
++        );
++        assert_eq!(usage.windows().count(), 1);
++
++        let window = usage.windows().next().unwrap();
++        assert_eq!(window.status, AccountUsageStatus::Allowed);
++        assert_eq!(window.utilization, Some(0.30));
++        let label = window.kind.label().to_string();
++        assert!(
++            label.contains("Fable"),
++            "the row must carry the server-supplied display name — it is the only thing \
++             naming this window; label was {label:?}"
++        );
++    }
++
++    #[test]
++    fn account_usage_keeps_two_model_scoped_windows_apart() {
++        // HOSTILE HALF (wrongly collapsing): every model-scoped window arrives under the
++        // one `rateLimitType`. A variant keyed by the wire kind alone makes the second
++        // payload overwrite the first in place, and one of the two rows disappears with
++        // no error anywhere.
++        let mut usage = AccountUsage::default();
++        usage.ingest(&model_scoped("Fable", "allowed", 0.30));
++        usage.ingest(&model_scoped("Opus 5", "allowed_warning", 0.80));
++
++        assert_eq!(
++            usage.windows().count(),
++            2,
++            "two model-scoped windows share one rateLimitType and are still two windows"
++        );
++        let labels: Vec<String> = usage
++            .windows()
++            .map(|window| window.kind.label().to_string())
++            .collect();
++        assert!(
++            labels.iter().any(|label| label.contains("Fable")),
++            "labels were {labels:?}"
++        );
++        assert!(
++            labels.iter().any(|label| label.contains("Opus 5")),
++            "labels were {labels:?}"
++        );
++        assert_ne!(
++            labels[0], labels[1],
++            "two rows a user must tell apart cannot render the same label"
++        );
++    }
++
++    #[test]
++    fn account_usage_updates_one_model_scoped_window_in_place() {
++        // The converse hostile half (wrongly splitting): the SDK reports the window that
++        // moved, over and over. A key that carries anything per-event — a counter, the
++        // reset instant, the utilization — turns one window into a growing list of rows.
++        let mut usage = AccountUsage::default();
++        assert!(usage.ingest(&model_scoped("Fable", "allowed", 0.30)));
++        assert!(usage.ingest(&model_scoped("Fable", "allowed_warning", 0.90)));
++
++        assert_eq!(
++            usage.windows().count(),
++            1,
++            "the same model-scoped window moving must update in place, not duplicate"
++        );
++        let window = usage.windows().next().unwrap();
++        assert_eq!(window.status, AccountUsageStatus::Warning);
++        assert_eq!(window.utilization, Some(0.90));
++
++        assert!(
++            !usage.ingest(&model_scoped("Fable", "allowed_warning", 0.90)),
++            "an identical payload must not report a change, or the panel redraws every turn"
++        );
++    }
++
++    #[test]
++    fn account_usage_names_model_scoped_windows_case_sensitively() {
++        // The third element: `displayName` is a server-supplied string, and the key the
++        // patch derives from it is a value the patch invents. Two names the server chose
++        // to spell differently are two windows; a key normalised for display (lowercased,
++        // trimmed) silently folds them together and loses one row's number.
++        let mut usage = AccountUsage::default();
++        usage.ingest(&model_scoped("Fable", "allowed", 0.10));
++        usage.ingest(&model_scoped("fable", "allowed", 0.20));
++
++        assert_eq!(
++            usage.windows().count(),
++            2,
++            "the server named two windows; normalising the name into one key drops one"
++        );
++    }
++
++    #[test]
++    fn account_usage_still_drops_an_unknown_window_kind() {
++        // Adding a name is not opening the enum. This must be green before the patch and
++        // green after it: a bar under a guessed label is worse than one fewer bar.
++        let mut usage = AccountUsage::default();
++        assert!(!usage.ingest(&rate_limit("seven_day_oauth_apps", "allowed", 0.50)));
++        assert!(!usage.ingest(&rate_limit("thirty_day_something_new", "allowed", 0.50)));
++        assert!(
++            usage.is_empty(),
++            "from_wire keeps dropping what it cannot name"
++        );
++    }
++
++    #[test]
++    fn account_usage_drops_a_model_scoped_window_with_no_usable_display_name() {
++        // A model-scoped window is nameable ONLY by its displayName. Without one there is
++        // nothing to label the bar with, so the same rule applies as to an unknown kind.
++        // Green today (the whole kind is dropped) and it must stay green afterwards.
++        let mut usage = AccountUsage::default();
++        assert!(!usage.ingest(&serde_json::json!({
++            "status": "allowed",
++            "rateLimitType": "model_scoped",
++            "utilization": 0.40,
++            "resetsAt": 1_800_000_000i64,
++        })));
++        assert!(!usage.ingest(&serde_json::json!({
++            "status": "allowed",
++            "rateLimitType": "model_scoped",
++            "displayName": 7,
++            "utilization": 0.40,
++        })));
++        assert!(!usage.ingest(&serde_json::json!({
++            "status": "allowed",
++            "rateLimitType": "model_scoped",
++            "displayName": "",
++            "utilization": 0.40,
++        })));
++        assert!(
++            usage.is_empty(),
++            "an unnamed model-scoped window has no label and must be dropped, not guessed at"
++        );
++    }
++
++    #[test]
++    fn model_scoped_window_does_not_displace_a_static_window() {
++        // The derived key, asked about a THIRD element: the static kinds already occupy
++        // the label namespace this patch writes into. A model-scoped window whose display
++        // name renders like a static row's label is still a different window, and keying
++        // (or deduplicating) by the rendered string folds it onto the static row and
++        // overwrites a number the user is reading.
++        let mut usage = AccountUsage::default();
++        usage.ingest(&rate_limit("seven_day_opus", "allowed_warning", 0.90));
++        usage.ingest(&model_scoped("(Opus)", "allowed", 0.10));
++
++        assert_eq!(
++            usage.windows().count(),
++            2,
++            "a model-scoped window that mimics a static label is not that static window"
++        );
++        let opus = usage
++            .windows()
++            .find(|window| window.kind == AccountUsageWindowKind::SevenDayOpus)
++            .expect("the static seven-day Opus window must survive the model-scoped one");
++        assert_eq!(
++            opus.utilization,
++            Some(0.90),
++            "the static window's number must not be overwritten by a model-scoped row"
++        );
++    }
+     use super::*;
+     use anyhow::anyhow;
+     use feature_flags::FeatureFlag as _;
+-- 
+2.55.0
+
