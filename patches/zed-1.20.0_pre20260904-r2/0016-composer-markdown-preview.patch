@@ -1,6 +1,6 @@
-From d8e684f59667db5c6806f176bdd2102dffc6f170 Mon Sep 17 00:00:00 2001
+From 5b6a0f3ce7da29b4d2f9895d4ee225ebabca5e11 Mon Sep 17 00:00:00 2001
 From: lucascouts <diego.evangelista5642@gmail.com>
-Date: Sat, 5 Sep 2026 21:27:26 -0300
+Date: Sun, 6 Sep 2026 14:40:34 -0300
 Subject: [PATCH] feat(agent_ui): preview the composer's draft as rendered
  markdown
 MIME-Version: 1.0
@@ -26,44 +26,92 @@ checks again never notices. Showing the preview builds from the current text, an
 an edit while it is open refreshes it, so what is displayed cannot drift from
 what is written.
 
-Reached through a `ToggleMessagePreview` action rather than a button. The action
-carries a doc comment, which is what Zed shows in the command palette, so it is
-invokable without a keybinding and bindable by anyone who wants one. A toolbar
-button is a reasonable follow-up; it is not needed for the preview to be offered.
+**Two things here came from watching a person use it, and neither was reachable
+from a test.** The first version shipped with no button and no scrollbar, behind
+463 passing unit tests, a clean clippy and a successful release build:
 
-Of the five patches in this batch this is the only one that adds UI rather than
-reaching machinery Zed already had, which is why it is the largest — a field, an
-action, a toggle, a refresh on edit, and a render. Everything it draws with
-already existed.
+- **The preview area scrolls and now says so.** `overflow_y_scroll` alone gives a
+  region that scrolls with nothing drawn to indicate it, so a draft taller than
+  the preview's cap reads as truncated. It now carries a tracked `ScrollHandle`
+  and `vertical_scrollbar_for`, the idiom `agent_registry_ui`,
+  `threads_archive_view` and `conversation_view` already use.
 
-Tests: four cases. The composer opens in editing mode, not preview; the preview
-renders the current draft; an edit after the preview is open re-renders it (the
-cached-entity trap); and previewing an empty draft is harmless.
+- **The toggle has a button, not only an action.** `ToggleMessagePreview` through
+  the command palette is a real path — but the person maintaining this overlay,
+  who wrote the neighbouring patch the same day, had to ask how to reach it. An
+  entry nobody discovers is a weak way to *offer* something. The button lives in
+  the composer's own row and calls the same `toggle_preview`, so it and the
+  palette cannot come to mean different things, and its tooltip is built with
+  `Tooltip::for_action_in` so finding the button also teaches the action and any
+  keybinding on it.
+
+The button reports which state it is in — the icon shows the state, the tooltip
+names what a click does — and that pairing is split into a small free function so
+half of it can be asserted without a window. An affordance that looks identical
+whether the preview is on or off reports nothing, and this crate has no windowed
+harness for the composer to catch that any other way.
+
+Of the patches in this batch this is the only one that adds UI rather than
+reaching machinery Zed already had, which is why it is the largest. Everything it
+draws with already existed.
+
+Tests: five. The composer opens in editing mode, not preview; the preview renders
+the current draft; an edit after the preview is open re-renders it (the
+cached-entity trap); previewing an empty draft is harmless; and the toggle's icon
+and tooltip both invert with the state.
 
 Verified: `cargo check -p agent_ui`, `cargo clippy -p agent_ui --all-targets` and
-`rustfmt --check` all clean; `cargo test -p agent_ui --lib` 463 passed, 0 failed.
-Compile- and unit-verified only — that the preview appears on screen and reads
-correctly is an observation for a running editor, not something this crate
-asserts.
+`rustfmt --check` all clean; `cargo test -p agent_ui --lib` 464 passed, 0 failed.
+Everything above the unit rung is still unverified here: that the scrollbar
+appears, that the button is where a hand expects it, and that the rendered
+markdown reads correctly are observations for a running editor. The first version
+of this patch said the same sentence, and it was right.
 ---
+ .../src/conversation_view/thread_view.rs      |   4 +
+ crates/agent_ui/src/message_editor.rs         | 305 +++++++++++++++++-
+ 2 files changed, 302 insertions(+), 7 deletions(-)
 
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index 0a1fed0..549baa5 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -4434,6 +4434,10 @@ impl ThreadView {
+                                     .flex_wrap()
+                                     .gap_0p5()
+                                     .child(self.render_add_context_button(cx))
++                                    .child(MessageEditor::render_preview_toggle(
++                                        &self.message_editor,
++                                        cx,
++                                    ))
+                                     .child(self.render_follow_toggle(cx))
+                                     .children(self.render_fast_mode_control(cx))
+                                     .children(self.render_thinking_control(cx)),
 diff --git a/crates/agent_ui/src/message_editor.rs b/crates/agent_ui/src/message_editor.rs
-index 044e788..f068de1 100644
+index 044e788..f770b48 100644
 --- a/crates/agent_ui/src/message_editor.rs
 +++ b/crates/agent_ui/src/message_editor.rs
-@@ -26,9 +26,10 @@ use futures::{FutureExt as _, future::join_all};
+@@ -25,10 +25,11 @@ use editor::{
+ use futures::{FutureExt as _, future::join_all};
  use gpui::{
      AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-     Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
+-    Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
 -    TextStyle, WeakEntity,
-+    TextStyle, WeakEntity, actions,
++    Focusable, Image, ImageFormat, KeyContext, ScrollHandle, SharedString, Subscription, Task,
++    TaskExt, TextStyle, WeakEntity, actions,
  };
  use language::{Buffer, language_settings::InlayHintKind};
 +use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
  use parking_lot::RwLock;
  use project::AgentId;
  use project::{
-@@ -45,6 +46,14 @@ use util::{ResultExt, debug_panic};
+@@ -39,12 +40,20 @@ use settings::Settings;
+ use std::{cmp::min, fmt::Write, ops::Range, rc::Rc, sync::Arc};
+ use text::LineEnding;
+ use theme_settings::ThemeSettings;
+-use ui::{ContextMenu, prelude::*};
++use ui::{ContextMenu, Tooltip, WithScrollbar, prelude::*};
+ use util::paths::PathStyle;
+ use util::{ResultExt, debug_panic};
  use workspace::{CollaboratorId, Workspace};
  use zed_actions::agent::{Chat, PasteRaw};
  
@@ -78,16 +126,21 @@ index 044e788..f068de1 100644
  #[derive(Default)]
  pub struct SessionCapabilities {
      prompt_capabilities: acp::PromptCapabilities,
-@@ -207,6 +216,8 @@ pub struct MessageEditor {
+@@ -207,6 +216,13 @@ pub struct MessageEditor {
      local_commands: SharedLocalCommands,
      agent_id: AgentId,
      thread_store: Option<Entity<ThreadStore>>,
 +    /// The rendered draft, while the preview is showing; `None` while editing.
 +    preview: Option<Entity<Markdown>>,
++    /// Where the preview is scrolled to. Owned by the editor rather than made
++    /// per frame because the scrollbar binds to the handle it was given on its
++    /// first frame and keeps it: a handle rebuilt later leaves the bar reading
++    /// an element nothing scrolls.
++    preview_scroll_handle: ScrollHandle,
      _subscriptions: Vec<Subscription>,
      _parse_slash_command_task: Task<()>,
  }
-@@ -559,6 +570,7 @@ impl MessageEditor {
+@@ -559,6 +575,7 @@ impl MessageEditor {
                      && !editor.read(cx).read_only(cx)
                  {
                      cx.emit(MessageEditorEvent::Edited);
@@ -95,15 +148,16 @@ index 044e788..f068de1 100644
                      editor.update(cx, |editor, cx| {
                          let snapshot = editor.snapshot(window, cx);
                          this.mention_set
-@@ -609,6 +621,7 @@ impl MessageEditor {
+@@ -609,6 +626,8 @@ impl MessageEditor {
              local_commands,
              agent_id,
              thread_store,
 +            preview: None,
++            preview_scroll_handle: ScrollHandle::new(),
              _subscriptions: subscriptions,
              _parse_slash_command_task: Task::ready(()),
          }
-@@ -734,6 +747,37 @@ impl MessageEditor {
+@@ -734,6 +753,37 @@ impl MessageEditor {
          self.editor.read(cx).text(cx).trim().is_empty()
      }
  
@@ -141,7 +195,7 @@ index 044e788..f068de1 100644
      pub fn is_completions_menu_visible(&self, cx: &App) -> bool {
          self.editor
              .read(cx)
-@@ -2019,9 +2063,33 @@ impl Focusable for MessageEditor {
+@@ -2019,9 +2069,86 @@ impl Focusable for MessageEditor {
      }
  }
  
@@ -150,22 +204,75 @@ index 044e788..f068de1 100644
 +    /// only focus handle belongs to the inner editor, so hiding that editor would
 +    /// empty the window's focus path and take `ToggleMessagePreview` out of the
 +    /// dispatch tree with it — leaving no way back out of the preview.
-+    fn render_preview(&self, window: &Window, cx: &Context<Self>) -> Option<impl IntoElement> {
++    fn render_preview(
++        &self,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> Option<impl IntoElement> {
 +        let preview = self.preview.clone()?;
++        // The scrollbar hangs off the wrapper, not off the element that scrolls:
++        // it is drawn as a child of whatever it is attached to, so attaching it to
++        // the scrolling element would scroll it away along with the draft it measures.
 +        Some(
 +            div()
-+                .id("message-editor-preview")
-+                .max_h_48()
-+                .overflow_y_scroll()
 +                .pb_1()
 +                .mb_1()
 +                .border_b_1()
 +                .border_color(cx.theme().colors().border_variant)
-+                .child(MarkdownElement::new(
-+                    preview,
-+                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-+                )),
++                .child(
++                    div()
++                        .id("message-editor-preview")
++                        .max_h_48()
++                        .overflow_y_scroll()
++                        .track_scroll(&self.preview_scroll_handle)
++                        .child(MarkdownElement::new(
++                            preview,
++                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
++                        )),
++                )
++                .vertical_scrollbar_for(&self.preview_scroll_handle, window, cx),
 +        )
++    }
++
++    /// The composer's own way in to the preview, beside `ToggleMessagePreview`.
++    /// It calls the same `toggle_preview`, so the button and the palette entry
++    /// cannot come to mean different things.
++    ///
++    /// An associated function taking the handle, because the button is rendered
++    /// by the composer's button row — which belongs to `ThreadView` — and reading
++    /// an entity there is safe where leasing it mid-render would not be.
++    pub(crate) fn render_preview_toggle(
++        message_editor: &Entity<Self>,
++        cx: &App,
++    ) -> impl IntoElement {
++        let showing = message_editor.read(cx).preview.is_some();
++        let (icon, tooltip) = preview_toggle_affordance(showing);
++        let focus_handle = message_editor.focus_handle(cx);
++        let message_editor = message_editor.clone();
++
++        IconButton::new("toggle-message-preview", icon)
++            .icon_size(IconSize::Small)
++            .icon_color(Color::Muted)
++            .toggle_state(showing)
++            .tooltip(move |_window, cx| {
++                Tooltip::for_action_in(tooltip, &ToggleMessagePreview, &focus_handle, cx)
++            })
++            .on_click(move |_, window, cx| {
++                message_editor.update(cx, |message_editor, cx| {
++                    message_editor.toggle_preview(window, cx)
++                });
++            })
++    }
++}
++
++/// How the toggle reports the preview's state: the icon shows the state it is in
++/// (as `collab_panel`'s watch toggle does), the tooltip names what a click does.
++/// Split out from the button so that half can be asserted without a window.
++fn preview_toggle_affordance(showing: bool) -> (IconName, &'static str) {
++    if showing {
++        (IconName::Eye, "Hide Markdown Preview")
++    } else {
++        (IconName::EyeOff, "Show Markdown Preview")
 +    }
 +}
 +
@@ -177,7 +284,7 @@ index 044e788..f068de1 100644
              .key_context("MessageEditor")
              .on_action(cx.listener(Self::chat))
              .on_action(cx.listener(Self::send_immediately))
-@@ -2031,8 +2099,12 @@ impl Render for MessageEditor {
+@@ -2031,8 +2158,12 @@ impl Render for MessageEditor {
              .capture_action(cx.listener(Self::cut))
              .on_action(cx.listener(Self::paste_raw))
              .capture_action(cx.listener(Self::paste))
@@ -191,7 +298,7 @@ index 044e788..f068de1 100644
                  let settings = ThemeSettings::get_global(cx);
  
                  let text_style = TextStyle {
-@@ -2057,7 +2129,7 @@ impl Render for MessageEditor {
+@@ -2057,7 +2188,7 @@ impl Render for MessageEditor {
                          ..Default::default()
                      },
                  )
@@ -200,7 +307,15 @@ index 044e788..f068de1 100644
      }
  }
  
-@@ -5849,4 +5921,147 @@ mod tests {
+@@ -2265,6 +2396,7 @@ mod tests {
+     use std::{ops::Range, path::Path, path::PathBuf, rc::Rc, sync::Arc};
+ 
+     use super::PromptLocalCommand;
++    use super::preview_toggle_affordance;
+     use acp_thread::MentionUri;
+     use agent::{ThreadStore, outline};
+     use agent_client_protocol::schema::v1 as acp;
+@@ -5849,4 +5981,163 @@ mod tests {
              "Expected text to start with 'prefix text\\n\\n', got: {text:?}"
          );
      }
@@ -347,4 +462,23 @@ index 044e788..f068de1 100644
 +            );
 +        });
 +    }
++
++    #[test]
++    fn preview_toggle_affordance_reports_the_state_it_is_in() {
++        let (hidden_icon, hidden_tooltip) = preview_toggle_affordance(false);
++        let (showing_icon, showing_tooltip) = preview_toggle_affordance(true);
++
++        // The button is the only thing telling a user whether the preview is on;
++        // an affordance that looks identical in both states reports nothing.
++        assert_ne!(hidden_icon, showing_icon);
++        assert_ne!(hidden_tooltip, showing_tooltip);
++
++        // The tooltip names what a click does, not what the state is, so it must
++        // read as an instruction and invert with the state.
++        assert!(hidden_tooltip.starts_with("Show"));
++        assert!(showing_tooltip.starts_with("Hide"));
++    }
  }
+-- 
+2.55.0
+
