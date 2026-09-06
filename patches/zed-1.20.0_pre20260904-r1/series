@@ -1,0 +1,85 @@
+# Apply order and USE-flag grouping, mirroring src_prepare() in the overlay's
+# single app-editors/zed ebuild -- resolved, never named. An overlay autoupdate
+# bumps that ebuild most days, so a version written here is stale before anyone
+# reads it; this header said zed-1.19.0_pre20260826-r1 while the tree packaged
+# 1.19.0_pre20260829, three bumps later. `resolve_version` in scripts/lib.sh is
+# how the tooling finds it.
+
+# @feature: claude-agent-acp-plus
+0001-force-enable-claude-agent-acp-plus.patch
+# 0003/0004 (per-option _meta description + preview) retired: upstream 950ec79
+# surfaces option descriptions natively via the ACP EnumOption.description
+# field, superseding the _claude/askUserQuestionOption _meta machinery (and
+# renamed MultiSelectItems::Untitled -> String). The numbers stay retired so
+# the remaining filenames keep matching the ebuild's PATCHES+=() lines.
+0005-elicitation-multiline-fields.patch
+0006-elicitation-option-previews.patch
+0007-manual-mode-badge.patch
+0008-clickable-attachments.patch
+# 0009: adopt the agent's config-option response when applying per-agent
+# defaults, so options that appear as a side effect (Fast mode once the
+# resolved model supports it) surface without a manual model switch.
+0009-Adopt-agent-s-config-option-response-when-applying-d.patch
+# 0010: a thread menu choice (permission mode, model, thinking effort, an ACP
+# agent's config options) applies to that thread only; Shift also makes it the
+# default for new threads. It applies to the packaged source on its own, so it
+# rides this flag by choice rather than by dependency -- it also covers the
+# native agent's own menus, which this flag otherwise has nothing to do with.
+0010-shift-to-set-as-default.patch
+# 0011: an "Account" section in the context tooltip, showing the account quota
+# windows (5-hour, weekly, per-model) the adapter already forwards under
+# _meta["_claude/rateLimit"] and Zed previously discarded. It rides this flag by
+# dependency, not by choice: no other agent sends that key, so without the
+# adapter the section never renders.
+0011-account-usage-panel.patch
+# 0012: a "Worktrees" entry in the agent panel's menu, dispatching the existing
+# zero-argument zed_actions::git::Worktree so the picker decides between creating
+# a worktree and switching to one. Zed already ships the capability end to end and
+# the panel already reaches it -- but only under request.use_new_worktree, which is
+# an input of the create_thread AGENT TOOL, so the model could open a worktree and
+# the person looking at the same panel could not. It applies to the packaged source
+# on its own, so like 0010 it rides this flag by choice rather than by dependency:
+# nothing about a worktree needs the adapter.
+0012-agent-panel-worktree-entry.patch
+# 0013: the model-scoped quota window. The adapter forwards every
+# rate_limits.model_scoped[] entry under the single wire kind "model_scoped",
+# and from_wire had no arm for it, so the per-model row 0011's Account section
+# was built to show never arrived. Adds a dynamic variant carrying the
+# server-supplied display name -- it adds a name, it does not open the enum:
+# an unrecognised kind is still dropped. Rides this flag BY DEPENDENCY, like
+# 0011: no other agent sends that key.
+0013-model-scoped-quota-window.patch
+# 0014: a copy button on the user's own message, returning the string the edit
+# path already serialises (ContentBlock::to_markdown, what the LostFocus handler
+# compares against) rather than a second serialisation. The button sits on the
+# shared container before the editable/non-editable branch, so subagent messages
+# -- always non-editable -- get it too. Pure Zed affordance, so it rides this
+# flag BY CHOICE, the way 0010 and 0012 do.
+0014-copy-the-user-s-own-message.patch
+# 0015: the thread archive scoped to its project. Three reads were global, not
+# one: the list, the ArchivedOnly fall-back guard, and the archived-only
+# toggle's own disabled state. Deliberately NOT via the store's entries_for_path
+# -- that reader drops archived threads, which is correct for the sidebar and
+# fatal for an archive view. Pure Zed, BY CHOICE.
+0015-scoped-thread-history.patch
+# 0016: a rendered-markdown preview of the composer's draft, through the same
+# MarkdownElement that draws every agent response. Reached by the
+# ToggleMessagePreview action (command palette; bindable). The source is
+# re-derived on each toggle and refreshed on edit -- an Entity<Markdown> built
+# once renders the first draft forever while passing every two-step test. Pure
+# Zed, BY CHOICE, and the only one of the five that is new UI rather than an
+# affordance over existing machinery.
+0016-composer-markdown-preview.patch
+# 0017: native rendering for a compaction the adapter reports. The ACP
+# compaction_update variant is unreachable here -- agent-client-protocol 2.0.0
+# and -schema 1.5.0 contain zero occurrences of "compaction" -- so this reads
+# the adapter's versioned _meta.contextCompaction and dispatches into the
+# EXISTING push_context_compaction. An unknown version falls through to the
+# generic tool row untouched. Both the opening and terminal frames are consumed
+# at the same seam, or update_tool_call fabricates a "Tool call not found"
+# failure row beside the entry. Rides this flag BY DEPENDENCY: only this adapter
+# emits that key.
+0017-native-compaction-entry.patch
+
+# @feature: claude-code-ide
+0002-claude-code-ide-integration.patch

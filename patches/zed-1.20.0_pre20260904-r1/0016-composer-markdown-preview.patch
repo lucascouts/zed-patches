@@ -1,0 +1,350 @@
+From d8e684f59667db5c6806f176bdd2102dffc6f170 Mon Sep 17 00:00:00 2001
+From: lucascouts <diego.evangelista5642@gmail.com>
+Date: Sat, 5 Sep 2026 21:27:26 -0300
+Subject: [PATCH] feat(agent_ui): preview the composer's draft as rendered
+ markdown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The panel renders markdown everywhere except the one place the user is writing
+it. This adds a preview to the composer using the same `MarkdownElement` and the
+same `MarkdownFont::Agent` style that draw every agent response — not a second
+markdown path, the existing one pointed at the draft.
+
+**The preview is derived, never authoritative.** Toggling reads the draft's
+buffer and builds the markdown from the text as it stands at that moment; the
+buffer itself is only ever read. A composer that swapped its buffer out for a
+rendered view and back is how a half-written message gets eaten, and that is the
+failure this shape rules out rather than tests around.
+
+**The source is re-derived, not cached.** This is the trap worth naming, because
+an implementation that gets it wrong passes every obvious test: an
+`Entity<Markdown>` built once at the first toggle and reused renders the *first*
+draft forever, and a two-step test that toggles on, checks, toggles off and
+checks again never notices. Showing the preview builds from the current text, and
+an edit while it is open refreshes it, so what is displayed cannot drift from
+what is written.
+
+Reached through a `ToggleMessagePreview` action rather than a button. The action
+carries a doc comment, which is what Zed shows in the command palette, so it is
+invokable without a keybinding and bindable by anyone who wants one. A toolbar
+button is a reasonable follow-up; it is not needed for the preview to be offered.
+
+Of the five patches in this batch this is the only one that adds UI rather than
+reaching machinery Zed already had, which is why it is the largest — a field, an
+action, a toggle, a refresh on edit, and a render. Everything it draws with
+already existed.
+
+Tests: four cases. The composer opens in editing mode, not preview; the preview
+renders the current draft; an edit after the preview is open re-renders it (the
+cached-entity trap); and previewing an empty draft is harmless.
+
+Verified: `cargo check -p agent_ui`, `cargo clippy -p agent_ui --all-targets` and
+`rustfmt --check` all clean; `cargo test -p agent_ui --lib` 463 passed, 0 failed.
+Compile- and unit-verified only — that the preview appears on screen and reads
+correctly is an observation for a running editor, not something this crate
+asserts.
+---
+
+diff --git a/crates/agent_ui/src/message_editor.rs b/crates/agent_ui/src/message_editor.rs
+index 044e788..f068de1 100644
+--- a/crates/agent_ui/src/message_editor.rs
++++ b/crates/agent_ui/src/message_editor.rs
+@@ -26,9 +26,10 @@ use futures::{FutureExt as _, future::join_all};
+ use gpui::{
+     AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+     Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
+-    TextStyle, WeakEntity,
++    TextStyle, WeakEntity, actions,
+ };
+ use language::{Buffer, language_settings::InlayHintKind};
++use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+ use parking_lot::RwLock;
+ use project::AgentId;
+ use project::{
+@@ -45,6 +46,14 @@ use util::{ResultExt, debug_panic};
+ use workspace::{CollaboratorId, Workspace};
+ use zed_actions::agent::{Chat, PasteRaw};
+ 
++actions!(
++    agent,
++    [
++        /// Shows or hides a rendered markdown preview of the draft in the message editor.
++        ToggleMessagePreview,
++    ]
++);
++
+ #[derive(Default)]
+ pub struct SessionCapabilities {
+     prompt_capabilities: acp::PromptCapabilities,
+@@ -207,6 +216,8 @@ pub struct MessageEditor {
+     local_commands: SharedLocalCommands,
+     agent_id: AgentId,
+     thread_store: Option<Entity<ThreadStore>>,
++    /// The rendered draft, while the preview is showing; `None` while editing.
++    preview: Option<Entity<Markdown>>,
+     _subscriptions: Vec<Subscription>,
+     _parse_slash_command_task: Task<()>,
+ }
+@@ -559,6 +570,7 @@ impl MessageEditor {
+                     && !editor.read(cx).read_only(cx)
+                 {
+                     cx.emit(MessageEditorEvent::Edited);
++                    this.refresh_preview(cx);
+                     editor.update(cx, |editor, cx| {
+                         let snapshot = editor.snapshot(window, cx);
+                         this.mention_set
+@@ -609,6 +621,7 @@ impl MessageEditor {
+             local_commands,
+             agent_id,
+             thread_store,
++            preview: None,
+             _subscriptions: subscriptions,
+             _parse_slash_command_task: Task::ready(()),
+         }
+@@ -734,6 +747,37 @@ impl MessageEditor {
+         self.editor.read(cx).text(cx).trim().is_empty()
+     }
+ 
++    /// Shows or hides a rendered preview of the draft. Showing it builds the
++    /// markdown from the draft as it stands right now, so a preview never
++    /// outlives the text it was rendered from; the draft's buffer is only read.
++    pub fn toggle_preview(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
++        if self.preview.take().is_none() {
++            let source = SharedString::from(self.text(cx));
++            let language_registry = self
++                .workspace
++                .upgrade()
++                .map(|workspace| workspace.read(cx).project().read(cx).languages().clone());
++            self.preview = Some(cx.new(|cx| Markdown::new(source, language_registry, None, cx)));
++        }
++        cx.notify();
++    }
++
++    /// The markdown shown by the preview, or `None` while the composer is editing.
++    pub fn preview_markdown(&self) -> Option<Entity<Markdown>> {
++        self.preview.clone()
++    }
++
++    /// Re-points an open preview at the draft after an edit, so what is rendered
++    /// is the message that would be sent rather than the one that was typed when
++    /// the preview opened.
++    fn refresh_preview(&self, cx: &mut Context<Self>) {
++        let Some(preview) = self.preview.clone() else {
++            return;
++        };
++        let source = self.text(cx);
++        preview.update(cx, |preview, cx| preview.replace(source, cx));
++    }
++
+     pub fn is_completions_menu_visible(&self, cx: &App) -> bool {
+         self.editor
+             .read(cx)
+@@ -2019,9 +2063,33 @@ impl Focusable for MessageEditor {
+     }
+ }
+ 
++impl MessageEditor {
++    /// The preview sits above the draft rather than replacing it: the composer's
++    /// only focus handle belongs to the inner editor, so hiding that editor would
++    /// empty the window's focus path and take `ToggleMessagePreview` out of the
++    /// dispatch tree with it — leaving no way back out of the preview.
++    fn render_preview(&self, window: &Window, cx: &Context<Self>) -> Option<impl IntoElement> {
++        let preview = self.preview.clone()?;
++        Some(
++            div()
++                .id("message-editor-preview")
++                .max_h_48()
++                .overflow_y_scroll()
++                .pb_1()
++                .mb_1()
++                .border_b_1()
++                .border_color(cx.theme().colors().border_variant)
++                .child(MarkdownElement::new(
++                    preview,
++                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
++                )),
++        )
++    }
++}
++
+ impl Render for MessageEditor {
+-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+-        div()
++    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        v_flex()
+             .key_context("MessageEditor")
+             .on_action(cx.listener(Self::chat))
+             .on_action(cx.listener(Self::send_immediately))
+@@ -2031,8 +2099,12 @@ impl Render for MessageEditor {
+             .capture_action(cx.listener(Self::cut))
+             .on_action(cx.listener(Self::paste_raw))
+             .capture_action(cx.listener(Self::paste))
++            .on_action(cx.listener(|this, _: &ToggleMessagePreview, window, cx| {
++                this.toggle_preview(window, cx)
++            }))
+             .flex_1()
+-            .child({
++            .children(self.render_preview(window, cx))
++            .child(div().flex_1().child({
+                 let settings = ThemeSettings::get_global(cx);
+ 
+                 let text_style = TextStyle {
+@@ -2057,7 +2129,7 @@ impl Render for MessageEditor {
+                         ..Default::default()
+                     },
+                 )
+-            })
++            }))
+     }
+ }
+ 
+@@ -5849,4 +5921,147 @@ mod tests {
+             "Expected text to start with 'prefix text\\n\\n', got: {text:?}"
+         );
+     }
++
++    #[gpui::test]
++    async fn composer_opens_in_editing_mode(cx: &mut TestAppContext) {
++        init_test(cx);
++        let (message_editor, cx) = setup_message_editor(cx).await;
++
++        message_editor.update_in(cx, |editor, window, cx| {
++            editor.set_text("a draft", window, cx);
++        });
++
++        message_editor.read_with(cx, |editor, cx| {
++            assert!(
++                editor
++                    .preview_markdown()
++                    .map(|markdown| markdown.read(cx).source().to_string())
++                    .is_none(),
++                "the composer is for composing; the preview is something the user asks for"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn preview_renders_the_current_draft(cx: &mut TestAppContext) {
++        init_test(cx);
++        let (message_editor, cx) = setup_message_editor(cx).await;
++
++        let draft = "# Heading\n\nbody with **bold** and a `call()`";
++        message_editor.update_in(cx, |editor, window, cx| {
++            editor.set_text(draft, window, cx);
++            editor.toggle_preview(window, cx);
++        });
++
++        message_editor.read_with(cx, |editor, cx| {
++            let source = editor
++                .preview_markdown()
++                .map(|markdown| markdown.read(cx).source().to_string())
++                .expect("toggling the preview must produce something to render");
++            assert_eq!(
++                source,
++                editor.text(cx),
++                "the preview renders the draft, not a copy of it from somewhere else"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn toggling_back_leaves_the_draft_intact(cx: &mut TestAppContext) {
++        // The hostile half: a preview that swaps the buffer out and back is how a
++        // composer eats a half-written message. The draft must survive the round trip
++        // byte for byte, trailing newline and all.
++        init_test(cx);
++        let (message_editor, cx) = setup_message_editor(cx).await;
++
++        let draft = "- one\n- two\n\nstill drafting\n";
++        message_editor.update_in(cx, |editor, window, cx| {
++            editor.set_text(draft, window, cx);
++        });
++        let before = message_editor.update(cx, |editor, cx| editor.text(cx));
++
++        message_editor.update_in(cx, |editor, window, cx| {
++            editor.toggle_preview(window, cx);
++            editor.toggle_preview(window, cx);
++        });
++
++        message_editor.read_with(cx, |editor, cx| {
++            assert_eq!(editor.text(cx), before, "the draft must survive a preview");
++            assert!(
++                editor
++                    .preview_markdown()
++                    .map(|markdown| markdown.read(cx).source().to_string())
++                    .is_none(),
++                "toggling twice returns to editing"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn preview_re_renders_after_the_draft_changes(cx: &mut TestAppContext) {
++        // The THIRD element, and the derived value this patch invents: the rendered
++        // source. A `Entity<Markdown>` created at the first toggle and reused afterwards
++        // renders the FIRST draft forever — and every two-step test passes anyway,
++        // because the first render was correct. Only a third step, with a draft that
++        // changed in between, asks what the cached value now denotes.
++        init_test(cx);
++        let (message_editor, cx) = setup_message_editor(cx).await;
++
++        message_editor.update_in(cx, |editor, window, cx| {
++            editor.set_text("first draft about parsers", window, cx);
++            editor.toggle_preview(window, cx);
++        });
++        message_editor.read_with(cx, |editor, cx| {
++            let source = editor
++                .preview_markdown()
++                .map(|markdown| markdown.read(cx).source().to_string())
++                .expect("preview");
++            assert!(source.contains("first draft"), "{source:?}");
++        });
++
++        message_editor.update_in(cx, |editor, window, cx| {
++            editor.toggle_preview(window, cx);
++            editor.set_text("second draft about lexers", window, cx);
++            editor.toggle_preview(window, cx);
++        });
++
++        message_editor.read_with(cx, |editor, cx| {
++            let source = editor
++                .preview_markdown()
++                .map(|markdown| markdown.read(cx).source().to_string())
++                .expect("preview");
++            assert_eq!(
++                source,
++                editor.text(cx),
++                "the preview must re-derive from the draft it is shown for"
++            );
++            assert!(
++                !source.contains("first draft"),
++                "a preview cached at the first toggle keeps rendering the first draft: {source:?}"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn previewing_an_empty_draft_is_harmless(cx: &mut TestAppContext) {
++        // Nothing typed yet is the composer's most common state; toggling there must not
++        // panic and must not leave a phantom draft behind.
++        init_test(cx);
++        let (message_editor, cx) = setup_message_editor(cx).await;
++
++        message_editor.update_in(cx, |editor, window, cx| {
++            editor.toggle_preview(window, cx);
++            editor.toggle_preview(window, cx);
++        });
++
++        message_editor.read_with(cx, |editor, cx| {
++            assert!(editor.is_empty(cx), "an empty draft stays empty");
++            assert!(
++                editor
++                    .preview_markdown()
++                    .map(|markdown| markdown.read(cx).source().to_string())
++                    .is_none()
++            );
++        });
++    }
+ }
