@@ -1,0 +1,100 @@
+From fd77f76567911af2e3d1fba5295a4c067abfcf5a Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@protonmail.com>
+Date: Mon, 6 Jul 2026 23:36:50 -0300
+Subject: [PATCH] feat(feature_flags): force-enable acp-beta for local builds
+ (per-turn token count, terminal auth)
+
+Zed grants the `acp-beta` feature flag from the server, to staff accounts only,
+so a locally built Zed never receives it. `AcpBetaFeatureFlag` declares no
+`enabled_for_all` override (crates/feature_flags/src/flags.rs:24-27) and the
+trait default is `false` (crates/feature_flags/src/feature_flags.rs:130-132),
+which makes the four lines below the only way to turn the flag on in a source
+build.
+
+WHAT THE FLAG BUYS TODAY (verified 2026-07-31 by reading the vendored pin
+1ac840ab2f3ef68c832ad8b4c7789a8d7f5e04a2; story 008, sub-task 7.2)
+
+1. Per-turn token count. crates/acp_thread/src/acp_thread.rs:3867-3874 ingests
+   a prompt response's `usage` only `if cx.has_flag::<AcpBetaFeatureFlag>()`,
+   and it is the sole writer of `TokenUsage::input_tokens` / `output_tokens`.
+   Those feed `update_turn_tokens`
+   (crates/agent_ui/src/conversation_view/thread_view.rs:1422-1429, driven by
+   `AcpThreadEvent::TokenUsageUpdated` at
+   crates/agent_ui/src/conversation_view.rs:1806-1812), which is what renders
+   the in-progress and the finished turn token labels (thread_view.rs:7313-7321
+   and :6822-6832). With the flag off those counters only ever accumulate 0 and
+   both labels are suppressed by the `> TOKEN_THRESHOLD` (250) filter.
+
+   Stated precisely, because this is easy to over-claim: the flag does NOT gate
+   the context indicator as a whole. The `SessionUpdate::UsageUpdate` path
+   (acp_thread.rs:2640-2650) is unflagged and keeps filling
+   max_tokens/used_tokens/cost, so the context ring works either way. Nor does
+   the flag deliver the input/output breakdown to us: the split ring and
+   tooltip (thread_view.rs:4771 and :5749) additionally require
+   `supports_split_token_display` -> `as_native_thread` (:1194-1198), a
+   downcast to `NativeAgentConnection` that always fails for an external ACP
+   agent. For an external agent the flag's visible effect is the per-turn token
+   count, nothing more.
+
+2. Stabilized terminal authentication. crates/agent_servers/src/acp.rs:1887
+   matches the typed `acp::AuthMethod::Terminal` arm only
+   `if cx.has_flag::<AcpBetaFeatureFlag>()`. With the flag off it falls through
+   (:1908-1909) to `meta_terminal_auth_task` (:1543-1566), the
+   pre-stabilization path, which returns `None` unless the auth method carries
+   a legacy `_meta["terminal-auth"]` object. claude-agent-acp-plus still ships
+   that object alongside the typed method (src/acp-agent.ts:1306-1314 and
+   :1336-1352), so login does still work with the flag off today; what the flag
+   changes is that Zed honours the stabilized shape. The day the agent drops
+   that deprecated `_meta` block, a flagless Zed's login entry silently does
+   nothing.
+
+WHY THE ORIGINAL JUSTIFICATION LAPSED
+
+The patch was written for story 002 to unlock ACP elicitation form/url support,
+which the flag gated at the time. It no longer does:
+`client_capabilities_for_agent` (crates/agent_servers/src/acp.rs:764-792)
+advertises `.elicitation(ElicitationCapabilities::new().form(..).url(..))` at
+:786-790 unconditionally, and the function does not even take a `cx`, so no
+flag could gate it. Forcing the flag buys nothing for elicitation now.
+
+WHY RE-JUSTIFY RATHER THAN RETIRE
+
+Upstream recycles this flag on purpose: "We reuse this feature flag for new
+betas, so don't delete it if it is not currently in use"
+(crates/feature_flags/src/flags.rs:19-21). Its call sites therefore change
+meaning from release to release, which is precisely why "the patch still
+applies" has never answered "the patch is still needed". Expect to re-justify
+this header at pin bumps, not to trust it indefinitely.
+
+HOW TO RE-CHECK THIS HEADER, IN ONE COMMAND
+
+    rg -n 'AcpBetaFeatureFlag' crates/
+
+At this pin that yields exactly two non-test call sites, the two above
+(agent_servers/src/acp.rs:1887 and acp_thread/src/acp_thread.rs:3867), plus the
+declaration, two imports, and `cx.update_flags(..)` helpers inside `#[cfg(test)]`
+blocks. If that set changes, rewrite this header. If it empties out, or if every
+remaining site gains an unconditional fallback, drop the patch from `PATCHES` in
+the ebuild with a comment naming what superseded it.
+
+Only the prose above was rewritten, in place, on 2026-07-31 (story 008,
+sub-task 7.2). The hunks below are byte-identical to the original export, so the
+`From` line still names the commit this patch was first exported from.
+
+---
+
+diff --git a/crates/feature_flags/src/flags.rs b/crates/feature_flags/src/flags.rs
+index 6a10534..3375676 100644
+--- a/crates/feature_flags/src/flags.rs
++++ b/crates/feature_flags/src/flags.rs
+@@ -24,6 +24,10 @@ pub struct AcpBetaFeatureFlag;
+ impl FeatureFlag for AcpBetaFeatureFlag {
+     const NAME: &'static str = "acp-beta";
+     type Value = PresenceFlag;
++
++    fn enabled_for_all() -> bool {
++        true
++    }
+ }
+ register_feature_flag!(AcpBetaFeatureFlag);
+ 

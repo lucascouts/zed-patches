@@ -1,0 +1,310 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@protonmail.com>
+Date: Sun, 6 Sep 2026 12:09:17 -0300
+Subject: [PATCH] Open a dropped folder as its own project, behind a setting
+
+Dragging a folder into the window does not restore the session saved for it.
+Opening the same folder any other way does: the dialog, Open Recent, the
+welcome screen and the CLI all route through the free `workspace::open_paths`,
+which reaches `db.workspace_for_roots` and replays the tabs and the panel
+state. The drop handler calls the `Workspace::open_paths` INSTANCE method with
+`OpenVisible::OnlyDirectories` instead, which only adds a worktree to the
+project already open and never consults the workspace database.
+
+The loss is not passive. `save_workspace` runs
+
+    DELETE FROM workspaces WHERE workspace_id != ?1 AND paths IS ?2
+
+under the comment "Clear out old workspaces with the same paths". A drop
+creates a new workspace_id for paths that already had one, so every drag
+DELETES the saved record rather than merely failing to read it. Measured on a
+single project across four drags: workspace_id 53 -> 71 -> 73 -> 79, losing the
+tabs each time. The agent panel thread goes with it, being keyed by
+workspace_id in the scoped_kv_store. Upstream added a guard here for empty
+workspaces (`if !paths.paths.is_empty()`), which does not reach this case: a
+dropped folder never produces empty paths.
+
+`drop_folder_behavior` selects the route:
+
+  "add_to_project"  add the folder to the current project as another worktree
+  "open_project"    open it as its own project, restoring its saved session
+
+add_to_project is the default, so nothing changes for anyone who does not ask.
+That is deliberate rather than cautious: dragging a folder in to build a
+multi-root project is a legitimate thing to do on purpose, and silently turning
+it into "close this, open that" would break it.
+
+Two scoping decisions worth stating.
+
+The setting is only consulted when EVERY dropped path is a directory.
+`has_files_to_open` is already computed a few lines above, for the split
+decision, so a drop that includes even one file keeps today's behaviour exactly
+-- opening a file is unambiguously an edit-in-place gesture.
+
+Where the project lands is not this setting's business. `default_open_behavior`
+already answers "existing window or new one" for every other way of opening a
+project from the UI, so `drop_folder_open_mode` maps onto it rather than
+introducing a second knob that could only ever contradict the first. The
+mapping is the same one welcome.rs uses. `open_workspace_for_paths` then
+forces Activate when the current workspace is empty, so dropping into a blank
+window opens there instead of spawning a second one.
+
+That mapping is where the decision lives, so it is a free function with a test
+pinning all four combinations -- including the two that must produce None, the
+regression that would silently opt everyone in.
+
+Not registered in settings_ui/src/page_data.rs. The setting is documented where
+both its neighbours are, in assets/settings/default.json, and page_data.rs is a
+table upstream rewrites constantly -- it moved in the thirteen commits between
+the last two packaged snapshots alone. Cheap to add later if the setting earns
+a place in the UI; expensive to carry through every rebase before then.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ assets/settings/default.json               |  11 +++
+ crates/settings/src/vscode_import.rs       |   1 +
+ crates/settings_content/src/workspace.rs   |  33 +++++++
+ crates/workspace/src/pane.rs               | 100 ++++++++++++++++++++-
+ crates/workspace/src/workspace_settings.rs |   2 +
+ 5 files changed, 145 insertions(+), 2 deletions(-)
+
+diff --git a/assets/settings/default.json b/assets/settings/default.json
+index 63c16cf..b8faf19 100644
+--- a/assets/settings/default.json
++++ b/assets/settings/default.json
+@@ -181,6 +181,17 @@
+   //  2. Open projects in a new window
+   //         "default_open_behavior": "new_window"
+   "default_open_behavior": "existing_window",
++  // What dropping a folder onto the window does. Only consulted when every
++  // dropped path is a directory -- a drop that includes a file always opens
++  // the file in the current project.
++  //
++  // May take 2 values:
++  //  1. Add the folder to the current project as another worktree
++  //         "drop_folder_behavior": "add_to_project"
++  //  2. Open the folder as its own project, restoring the tabs and panel
++  //     state saved for it
++  //         "drop_folder_behavior": "open_project"
++  "drop_folder_behavior": "add_to_project",
+   // Whether to attempt to restore previous file's state when opening it again.
+   // The state is stored per pane.
+   // When disabled, defaults are applied instead of the state restoration.
+diff --git a/crates/settings/src/vscode_import.rs b/crates/settings/src/vscode_import.rs
+index fbf9df9..ae5d1f6 100644
+--- a/crates/settings/src/vscode_import.rs
++++ b/crates/settings/src/vscode_import.rs
+@@ -1052,6 +1052,7 @@ impl VsCodeSettings {
+             centered_layout: None,
+             cli_default_open_behavior: None,
+             default_open_behavior: None,
++            drop_folder_behavior: None,
+             close_on_file_delete: None,
+             close_panel_on_toggle: None,
+             command_aliases: Default::default(),
+diff --git a/crates/settings_content/src/workspace.rs b/crates/settings_content/src/workspace.rs
+index 4e27a8d..12ba311 100644
+--- a/crates/settings_content/src/workspace.rs
++++ b/crates/settings_content/src/workspace.rs
+@@ -58,6 +58,13 @@ pub struct WorkspaceSettingsContent {
+     ///
+     /// Default: existing_window
+     pub default_open_behavior: Option<DefaultOpenBehavior>,
++    /// What dropping a folder onto the window does.
++    ///
++    /// Only consulted when every dropped path is a directory; a drop that
++    /// includes a file always opens the file in the current project.
++    ///
++    /// Default: add_to_project
++    pub drop_folder_behavior: Option<DropFolderBehavior>,
+     /// Whether to attempt to restore previous file's state when opening it again.
+     /// The state is stored per pane.
+     /// When disabled, defaults are applied instead of the state restoration.
+@@ -502,6 +509,32 @@ pub enum DefaultOpenBehavior {
+     NewWindow,
+ }
+ 
++#[derive(
++    Copy,
++    Clone,
++    PartialEq,
++    Eq,
++    Default,
++    Serialize,
++    Deserialize,
++    JsonSchema,
++    MergeFrom,
++    Debug,
++    strum::VariantArray,
++    strum::VariantNames,
++)]
++#[serde(rename_all = "snake_case")]
++pub enum DropFolderBehavior {
++    /// Add the dropped folder to the current project as another worktree.
++    #[default]
++    #[strum(serialize = "Add to Current Project")]
++    AddToProject,
++    /// Open the dropped folder as its own project, restoring the tabs and
++    /// panel state saved for it.
++    #[strum(serialize = "Open as a Project")]
++    OpenProject,
++}
++
+ #[derive(
+     Copy,
+     Clone,
+diff --git a/crates/workspace/src/pane.rs b/crates/workspace/src/pane.rs
+index 56338cb..275d7d6 100644
+--- a/crates/workspace/src/pane.rs
++++ b/crates/workspace/src/pane.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
++    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenMode, OpenOptions,
+     OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
+     Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
+     focus_follows_mouse::FocusFollowsMouse as _,
+@@ -31,7 +31,7 @@ use parking_lot::Mutex;
+ use project::{DirectoryLister, Project, ProjectEntryId, ProjectPath, WorktreeId};
+ use schemars::JsonSchema;
+ use serde::Deserialize;
+-use settings::{Settings, SettingsStore};
++use settings::{DefaultOpenBehavior, DropFolderBehavior, Settings, SettingsStore};
+ use std::{
+     any::Any,
+     cmp, fmt, mem,
+@@ -4207,6 +4207,44 @@ impl Pane {
+                         paths
+                     };
+ 
++                    // Every dropped path is a directory: this can open them as their
++                    // own project -- restoring the tabs and panel state saved for those
++                    // paths -- instead of adding them to the project already open. The
++                    // instance `open_paths` below never reaches the workspace
++                    // database, which is why the saved session is lost today.
++                    // `open_workspace_for_paths` is the same route Open Recent and
++                    // the welcome screen already take.
++                    if !has_files_to_open {
++                        let opened = workspace.update_in(cx, |workspace, window, cx| {
++                            // Resolved before the &mut borrow taken below.
++                            let open_mode = {
++                                let settings = WorkspaceSettings::get_global(cx);
++                                drop_folder_open_mode(
++                                    settings.drop_folder_behavior,
++                                    settings.default_open_behavior,
++                                )
++                            };
++                            open_mode.map(|open_mode| {
++                                workspace.open_workspace_for_paths(
++                                    open_mode,
++                                    paths.clone(),
++                                    window,
++                                    cx,
++                                )
++                            })
++                        });
++                        if let Ok(Some(open_task)) = opened {
++                            if let Err(e) = open_task.await {
++                                workspace
++                                    .update_in(cx, |workspace, _, cx| {
++                                        workspace.show_error(format!("Error: {e}"), cx);
++                                    })
++                                    .ok();
++                            }
++                            return;
++                        }
++                    }
++
+                     if let Ok((open_task, to_pane)) =
+                         workspace.update_in(cx, |workspace, window, cx| {
+                             if let Some(split_direction) = split_direction {
+@@ -5078,6 +5116,26 @@ impl Render for DraggedTab {
+     }
+ }
+ 
++/// Which route a drop of nothing but directories takes: `None` adds the folders
++/// to the project already open, `Some(mode)` opens them as their own project --
++/// restoring the session saved for those paths -- with that window placement.
++///
++/// Where the project lands is deliberately not `drop_folder_behavior`'s to
++/// decide. `default_open_behavior` already answers that for every other way of
++/// opening a project from the UI, so a second knob could only contradict it.
++fn drop_folder_open_mode(
++    drop_behavior: DropFolderBehavior,
++    open_behavior: DefaultOpenBehavior,
++) -> Option<OpenMode> {
++    match drop_behavior {
++        DropFolderBehavior::AddToProject => None,
++        DropFolderBehavior::OpenProject => Some(match open_behavior {
++            DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
++            DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
++        }),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::{cell::Cell, iter::zip, num::NonZero, rc::Rc};
+@@ -9662,4 +9720,42 @@ mod tests {
+             }
+         }
+     }
++    #[test]
++    fn test_drop_folder_open_mode() {
++        // The default must not open a project: dropping a folder has added it to
++        // the current one for as long as the affordance has existed, and this
++        // setting is opt-in precisely so that stays true.
++        assert_eq!(
++            drop_folder_open_mode(
++                DropFolderBehavior::default(),
++                DefaultOpenBehavior::ExistingWindow
++            ),
++            None
++        );
++        // ... and the window setting cannot smuggle the behaviour in either.
++        assert_eq!(
++            drop_folder_open_mode(
++                DropFolderBehavior::AddToProject,
++                DefaultOpenBehavior::NewWindow
++            ),
++            None
++        );
++
++        // Opted in, the window placement is default_open_behavior's answer,
++        // unchanged -- that is the whole contract between the two settings.
++        assert_eq!(
++            drop_folder_open_mode(
++                DropFolderBehavior::OpenProject,
++                DefaultOpenBehavior::ExistingWindow
++            ),
++            Some(OpenMode::Activate)
++        );
++        assert_eq!(
++            drop_folder_open_mode(
++                DropFolderBehavior::OpenProject,
++                DefaultOpenBehavior::NewWindow
++            ),
++            Some(OpenMode::NewWindow)
++        );
++    }
+ }
+diff --git a/crates/workspace/src/workspace_settings.rs b/crates/workspace/src/workspace_settings.rs
+index eff3a0a..915ea89 100644
+--- a/crates/workspace/src/workspace_settings.rs
++++ b/crates/workspace/src/workspace_settings.rs
+@@ -24,6 +24,7 @@ pub struct WorkspaceSettings {
+     pub restore_on_startup: settings::RestoreOnStartupBehavior,
+     pub cli_default_open_behavior: settings::CliDefaultOpenBehavior,
+     pub default_open_behavior: settings::DefaultOpenBehavior,
++    pub drop_folder_behavior: settings::DropFolderBehavior,
+     pub restore_on_file_reopen: bool,
+     pub reveal_if_open: bool,
+     pub drop_target_size: f32,
+@@ -123,6 +124,7 @@ impl Settings for WorkspaceSettings {
+             restore_on_startup: workspace.restore_on_startup.unwrap(),
+             cli_default_open_behavior: workspace.cli_default_open_behavior.unwrap(),
+             default_open_behavior: workspace.default_open_behavior.unwrap(),
++            drop_folder_behavior: workspace.drop_folder_behavior.unwrap(),
+             restore_on_file_reopen: workspace.restore_on_file_reopen.unwrap(),
+             reveal_if_open: workspace.reveal_if_open.unwrap(),
+             drop_target_size: workspace.drop_target_size.unwrap(),
