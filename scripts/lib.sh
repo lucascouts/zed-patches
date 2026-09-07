@@ -26,8 +26,8 @@ ZP_CATEGORY_PATH="app-editors/zed"
 # time. The overlay autoupdates, and any version written down here would be
 # stale before it was read.
 ZP_NPM_LOCKFILES=(
-	"claude-agent-fork/fork/package-lock.json"
-	"claude-agent-fork/claude-agent-acp-plus/package-lock.json"
+	"claude-agent-plus/fork/package-lock.json"
+	"claude-agent-plus/claude-agent-acp-plus/package-lock.json"
 	"claude-agent-tui/fork/package-lock.json"
 	"claude-agent-tui/claude-agent-tui/package-lock.json"
 )
