@@ -1,0 +1,402 @@
+From e3285fd69f925f4c9c89e38a7358c655de13e669 Mon Sep 17 00:00:00 2001
+From: lucascouts <diego.evangelista5642@gmail.com>
+Date: Sat, 5 Sep 2026 21:05:22 -0300
+Subject: [PATCH] feat(agent_ui): scope the thread archive to the project it
+ was opened from
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The archive view listed every thread on the machine. The sidebar beside it has
+always been scoped — it reads `entries_for_path(path_list, remote_connection)`
+while the archive read the bare `entries()` — so the two panes disagreed about
+what "your threads" means, and only one of them was right.
+
+**The obvious fix is wrong, and it fails silently.** Calling the store's own
+scoped reader, `entries_for_path`, is what this looks like it should do. That
+reader drops archived threads (`thread_metadata_store.rs`, and there is an
+upstream test named `test_entries_for_path_excludes_archived` pinning it) — which
+is correct for a sidebar and fatal here, where showing archived threads is the
+entire purpose. `ArchivedOnly` would render an empty list forever. So the scope
+is applied in this view instead, over `entries()`, keeping the archived rows.
+
+**Three reads were unscoped, not one.** The list is the obvious one. The second
+is the fall-back guard that decides whether to drop `ArchivedOnly` back to `All`:
+asked globally it declines to fall back because *some other project* has an
+archived thread, stranding the user in front of an empty list. The third is the
+archived-only toggle's own `disabled` state, computed the same global way — the
+button is enabled because another project has archived threads, and clicking it
+falls back immediately, so it reads as inert. Same defect, three pixels. All
+three now ask about this project.
+
+**A narrowing that is deliberate and worth knowing.** The scope is exact
+path-list equality, matching the store's primary scoped reader. A thread created
+while the window held roots `{A}` does not appear once the same window holds
+`{A, B}`. The sidebar compensates for this with a project-group union across
+main-worktree paths, per-workspace lists and linked worktrees; this view does
+not, because that union spans several indices — one of which also excludes
+archived rows and would need the same treatment — and importing it is a coupling
+re-resolved at every Zed bump. If the narrowing bites, widening it is a
+follow-up with a clear shape, not a defect to rediscover.
+
+An empty scope is the pathless project, not "no threads": a workspace with no
+folder open yields an empty `PathList`, which matches threads recorded with no
+worktree paths. That is the consistent answer rather than a special case.
+
+The search placeholder moves from "Search all threads…" to "Search this
+project's threads…", because after this change the old one is false.
+
+Tests: four cases — another project's threads stay out of both the plain and the
+archived list, the fall-back fires on *this* project's own emptiness, and it does
+not fire while this project still has an archived thread. That third case is the
+one a patch touching only the list would ship broken.
+
+Verified: `cargo check -p agent_ui`, `cargo clippy -p agent_ui --all-targets` and
+`rustfmt --check` all clean; `cargo test -p agent_ui --lib` 458 passed, and
+`cargo test -p sidebar --lib` 145 passed — the latter matters because
+`test_restore_serialized_archive_view_does_not_panic` drives the real
+`show_archive` path against a live workspace, so the scoped read is reached by
+construction rather than only by unit test. Not eyeball-verified in a running
+editor; that is what the live session is for.
+---
+
+diff --git a/crates/agent_ui/src/threads_archive_view.rs b/crates/agent_ui/src/threads_archive_view.rs
+index 09a3ea8..78a835d 100644
+--- a/crates/agent_ui/src/threads_archive_view.rs
++++ b/crates/agent_ui/src/threads_archive_view.rs
+@@ -29,6 +29,7 @@ use picker::{
+     highlighted_match_with_paths::{HighlightedMatch, HighlightedMatchWithPaths},
+ };
+ use project::{AgentId, AgentServerStore};
++use remote::RemoteConnectionOptions;
+ use settings::Settings as _;
+ use theme::ActiveTheme;
+ use ui::{
+@@ -127,6 +128,61 @@ pub fn fuzzy_match_positions(query: &str, candidate: &str) -> Option<Vec<usize>>
+     None
+ }
+ 
++/// The threads belonging to one project: those recorded against the same
++/// worktree paths, on the same connection.
++///
++/// Archived threads are kept. The store's own scoped reader,
++/// [`ThreadMetadataStore::entries_for_path`], drops them, which is exactly
++/// what this view exists to show — hence the scope is applied here instead.
++fn scoped_entries<'a>(
++    store: &'a ThreadMetadataStore,
++    path_list: &'a PathList,
++    remote_connection: Option<&'a RemoteConnectionOptions>,
++) -> impl Iterator<Item = &'a ThreadMetadata> + 'a {
++    store.entries().filter(move |thread| {
++        thread.folder_paths() == path_list && thread.matches_remote_connection(remote_connection)
++    })
++}
++
++/// The filter the archive list ends up under, and the threads it renders,
++/// newest first.
++///
++/// The filter is not always the one asked for: when `ArchivedOnly` is
++/// requested and nothing archived is left (the user just deleted the last
++/// one), it falls back to `All` rather than strand them in front of an empty
++/// list behind a disabled toggle.
++///
++/// Both reads are scoped to the project, and the second is easy to miss — the
++/// fall-back has to ask whether *this* project holds an archived thread. Asked
++/// globally it would decline to fall back because some other project holds
++/// one, which is the same stranding by another route.
++fn scoped_archive_sessions(
++    store: &ThreadMetadataStore,
++    requested_filter: ThreadFilter,
++    path_list: &PathList,
++    remote_connection: Option<&RemoteConnectionOptions>,
++) -> (ThreadFilter, Vec<ThreadMetadata>) {
++    let filter = if requested_filter == ThreadFilter::ArchivedOnly
++        && !scoped_entries(store, path_list, remote_connection).any(|thread| thread.archived)
++    {
++        ThreadFilter::All
++    } else {
++        requested_filter
++    };
++
++    let sessions = scoped_entries(store, path_list, remote_connection)
++        .filter(|thread| match filter {
++            ThreadFilter::All => true,
++            ThreadFilter::ArchivedOnly => thread.archived,
++        })
++        .sorted_by_cached_key(|thread| thread.created_at.unwrap_or(thread.updated_at))
++        .rev()
++        .cloned()
++        .collect();
++
++    (filter, sessions)
++}
++
+ pub enum ThreadsArchiveViewEvent {
+     Close,
+     Activate { thread: ThreadMetadata },
+@@ -170,7 +226,7 @@ impl ThreadsArchiveView {
+ 
+         let filter_editor = cx.new(|cx| {
+             let mut editor = Editor::single_line(window, cx);
+-            editor.set_placeholder_text("Search all threads…", window, cx);
++            editor.set_placeholder_text("Search this project's threads…", window, cx);
+             editor
+         });
+ 
+@@ -267,29 +323,35 @@ impl ThreadsArchiveView {
+             .is_focused(window)
+     }
+ 
++    /// The project this history is scoped to: the workspace's root paths and
++    /// the connection they live on — the pair the sidebar scopes by.
++    ///
++    /// A workspace with no folder open, or one already dropped, scopes to the
++    /// empty path list, which is what a thread started without a folder is
++    /// itself recorded under.
++    fn project_scope(&self, cx: &App) -> (PathList, Option<RemoteConnectionOptions>) {
++        let Some(workspace) = self.workspace.upgrade() else {
++            return (PathList::default(), None);
++        };
++        let workspace = workspace.read(cx);
++        (
++            PathList::new(&workspace.root_paths(cx)),
++            workspace.project().read(cx).remote_connection_options(cx),
++        )
++    }
++
+     fn update_items(&mut self, cx: &mut Context<Self>) {
++        let (path_list, remote_connection) = self.project_scope(cx);
+         let store = ThreadMetadataStore::global(cx).read(cx);
+ 
+-        // If we're filtering to archived threads but none remain (e.g. the
+-        // user just deleted the last one), fall back to showing all threads
+-        // so they aren't stranded with an empty list and a disabled toggle.
+-        if self.thread_filter == ThreadFilter::ArchivedOnly
+-            && store.archived_entries().next().is_none()
+-        {
+-            self.thread_filter = ThreadFilter::All;
+-        }
+-
+-        let thread_filter = self.thread_filter;
+-        let sessions = store
+-            .entries()
+-            .filter(|t| match thread_filter {
+-                ThreadFilter::All => true,
+-                ThreadFilter::ArchivedOnly => t.archived,
+-            })
+-            .sorted_by_cached_key(|t| t.created_at.unwrap_or(t.updated_at))
+-            .rev()
+-            .cloned()
+-            .collect::<Vec<_>>();
++        // The filter comes back out because it can fall back to `All`.
++        let (thread_filter, sessions) = scoped_archive_sessions(
++            store,
++            self.thread_filter,
++            &path_list,
++            remote_connection.as_ref(),
++        );
++        self.thread_filter = thread_filter;
+ 
+         let query = self.filter_editor.read(cx).text(cx).to_lowercase();
+         let today = Local::now().naive_local().date();
+@@ -948,8 +1010,10 @@ impl ThreadsArchiveView {
+             .count();
+ 
+         let has_archived_threads = {
++            let (path_list, remote_connection) = self.project_scope(cx);
+             let store = ThreadMetadataStore::global(cx).read(cx);
+-            store.archived_entries().next().is_some()
++            scoped_entries(store, &path_list, remote_connection.as_ref())
++                .any(|thread| thread.archived)
+         };
+ 
+         let count_label = if entry_count == 1 {
+@@ -1688,4 +1752,188 @@ mod tests {
+             );
+         }
+     }
++
++    fn archive_thread_fixture(
++        session_id: &str,
++        archived: bool,
++        paths: &PathList,
++        age_seconds: i64,
++    ) -> ThreadMetadata {
++        let created = Utc::now() - chrono::Duration::seconds(age_seconds);
++        ThreadMetadata {
++            thread_id: ThreadId::new(),
++            archived,
++            session_id: Some(acp::SessionId::new(session_id)),
++            agent_id: agent::ZED_AGENT_ID.clone(),
++            title: Some(session_id.to_string().into()),
++            title_override: None,
++            updated_at: created,
++            created_at: Some(created),
++            interacted_at: None,
++            worktree_paths: project::WorktreePaths::from_folder_paths(paths),
++            remote_connection: None,
++        }
++    }
++
++    async fn store_with(
++        threads: Vec<ThreadMetadata>,
++        cx: &mut gpui::TestAppContext,
++    ) -> Entity<ThreadMetadataStore> {
++        cx.update(|cx| {
++            let settings_store = settings::SettingsStore::test(cx);
++            cx.set_global(settings_store);
++            ThreadMetadataStore::init_global(cx);
++        });
++        cx.run_until_parked();
++
++        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
++        store.update(cx, |store, cx| {
++            for thread in threads {
++                store.save(thread, cx);
++            }
++        });
++        cx.run_until_parked();
++        store
++    }
++
++    fn session_ids(threads: &[ThreadMetadata]) -> Vec<String> {
++        threads
++            .iter()
++            .filter_map(|thread| thread.session_id.as_ref().map(|id| id.0.to_string()))
++            .collect()
++    }
++
++    fn project_a() -> PathList {
++        PathList::new(&[std::path::Path::new("/project-a")])
++    }
++
++    fn project_b() -> PathList {
++        PathList::new(&[std::path::Path::new("/project-b")])
++    }
++
++    #[gpui::test]
++    async fn archive_view_lists_only_this_projects_threads(cx: &mut gpui::TestAppContext) {
++        // R4.4 itself: another project's threads are not this project's history.
++        let store = store_with(
++            vec![
++                archive_thread_fixture("a-newer", false, &project_a(), 10),
++                archive_thread_fixture("a-older", false, &project_a(), 100),
++                archive_thread_fixture("b-live", false, &project_b(), 50),
++            ],
++            cx,
++        )
++        .await;
++
++        cx.update(|cx| {
++            let (filter, sessions) =
++                scoped_archive_sessions(store.read(cx), ThreadFilter::All, &project_a(), None);
++
++            assert_eq!(filter, ThreadFilter::All);
++            assert_eq!(
++                session_ids(&sessions),
++                vec!["a-newer", "a-older"],
++                "only this project's threads, newest first"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn archived_only_lists_this_projects_archived_threads(cx: &mut gpui::TestAppContext) {
++        // The hostile half (wrongly COLLAPSING two projects into one history): both
++        // projects have an archived thread, and only this project's may be listed.
++        let store = store_with(
++            vec![
++                archive_thread_fixture("a-live", false, &project_a(), 10),
++                archive_thread_fixture("a-archived", true, &project_a(), 20),
++                archive_thread_fixture("b-archived", true, &project_b(), 30),
++            ],
++            cx,
++        )
++        .await;
++
++        cx.update(|cx| {
++            let (filter, sessions) = scoped_archive_sessions(
++                store.read(cx),
++                ThreadFilter::ArchivedOnly,
++                &project_a(),
++                None,
++            );
++
++            assert_eq!(
++                filter,
++                ThreadFilter::ArchivedOnly,
++                "this project has an archived thread, so there is nothing to fall back from"
++            );
++            assert_eq!(session_ids(&sessions), vec!["a-archived"]);
++        });
++    }
++
++    #[gpui::test]
++    async fn archive_view_falls_back_to_all_on_this_projects_own_threads(
++        cx: &mut gpui::TestAppContext,
++    ) {
++        // The THIRD element, and the half a patch that scopes only the list would ship
++        // broken: the fall-back guard at :277 is a SECOND unscoped read. This project has
++        // no archived thread; another project does. Left unscoped, the guard sees that
++        // other project's thread, declines to fall back, and the user sits in front of an
++        // empty list with the toggle disabled — the exact stranding the fall-back exists
++        // to prevent.
++        let store = store_with(
++            vec![
++                archive_thread_fixture("a-live", false, &project_a(), 10),
++                archive_thread_fixture("b-archived", true, &project_b(), 20),
++            ],
++            cx,
++        )
++        .await;
++
++        cx.update(|cx| {
++            let (filter, sessions) = scoped_archive_sessions(
++                store.read(cx),
++                ThreadFilter::ArchivedOnly,
++                &project_a(),
++                None,
++            );
++
++            assert_eq!(
++                filter,
++                ThreadFilter::All,
++                "no archived thread in THIS project means fall back, whatever other projects hold"
++            );
++            assert_eq!(
++                session_ids(&sessions),
++                vec!["a-live"],
++                "and the fall-back still shows only this project's threads"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn archive_view_does_not_fall_back_while_this_project_has_archived_threads(
++        cx: &mut gpui::TestAppContext,
++    ) {
++        // The converse (wrongly SPLITTING the guard the other way): scoping the guard must
++        // not make it answer "no archived threads" while this project plainly has one.
++        let store = store_with(
++            vec![
++                archive_thread_fixture("a-live", false, &project_a(), 10),
++                archive_thread_fixture("a-archived", true, &project_a(), 20),
++                archive_thread_fixture("b-live", false, &project_b(), 30),
++            ],
++            cx,
++        )
++        .await;
++
++        cx.update(|cx| {
++            let (filter, sessions) = scoped_archive_sessions(
++                store.read(cx),
++                ThreadFilter::ArchivedOnly,
++                &project_a(),
++                None,
++            );
++
++            assert_eq!(filter, ThreadFilter::ArchivedOnly);
++            assert_eq!(session_ids(&sessions), vec!["a-archived"]);
++        });
++    }
+ }
