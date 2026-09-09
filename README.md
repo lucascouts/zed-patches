@@ -56,9 +56,32 @@ isolation — the default run applies **every** patch, which is the strictest ca
 | `scripts/check-sync.sh [<PF>]` | verify the series against the ebuild, the overlay and the packaged source, in one pass |
 | `scripts/patch-branches.sh <PF> [--force]` | rebuild one branch per patch in the prepared tree, so a patch can be fixed as code |
 | `scripts/selftest.sh` | unit coverage, entirely on temporary fixtures — never touches the overlay or the real distfile |
+| `scripts/live-proof.py script <steps.json>` | drive a running Zed through the desktop portal and capture what a patch renders — the half `verify.sh` cannot answer |
+| `scripts/kwin-window.sh active\|list\|focus\|desktop\|setdesktop` | query or switch KWin windows and virtual desktops without injecting input |
 
 Exit codes are uniform: `0` success · `1` a patch did not apply · `2` environment
 problem (missing distfile, missing tree, unparseable ebuild, malformed series).
+
+### Proving a patch in a running editor
+
+`verify.sh` proves a patch *applies*; `live-proof.py` proves it *renders*. It is
+the only script here that touches the desktop, so it carries guards the others do
+not need:
+
+- **It refuses to inject into the window hosting the session that calls it.** When
+  the agent runs inside the Zed being driven — which it does, through the ACP
+  adapter — an unguarded keystroke lands in its own composer.
+- **It refuses to run against a locked session**, and **verifies every capture
+  decodes at a sane size**. Both come from `zeo`'s `scripts/shot.sh`, which found
+  the first the hard way: a locked session yields perfectly well-formed pictures
+  of nothing. A 1x1 PNG once sat among committed proofs looking exactly like
+  evidence.
+- **Windows are matched by project, never by caption.** A caption is
+  `<project> — <open file>` and the file half changes when a tab does.
+
+Captures belong under `docs/assets/` in the orchestration repository, versioned
+beside the report that cites them — never under `.epic/`, which is gitignored, and
+where evidence commits are silent no-ops.
 
 `EGIT_COMMIT` is always parsed from the ebuild, never hardcoded — the ebuild is the one
 place that already knows which commit is packaged.
