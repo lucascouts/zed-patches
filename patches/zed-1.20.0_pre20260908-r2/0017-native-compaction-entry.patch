@@ -1,0 +1,685 @@
+From f1a6347e15e0d4e81d7f113bb5d278941a257eb3 Mon Sep 17 00:00:00 2001
+From: lucascouts <diego.evangelista5642@gmail.com>
+Date: Sat, 5 Sep 2026 20:48:28 -0300
+Subject: [PATCH] feat(acp_thread): render an adapter-reported compaction as
+ the native entry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Zed already has a context-compaction entry and a constructor for it. What it did
+not have was any way to learn that an external agent had compacted, because the
+ACP variant that would say so does not exist in the protocol this Zed links:
+`agent-client-protocol 2.0.0` and `agent-client-protocol-schema 1.5.0` contain
+zero occurrences of the string "compaction", in any case, in any file. The
+`compaction_update` variant is in the TypeScript SDK and cannot be deserialised
+here no matter what an adapter sends.
+
+So this takes the route `0011` proved instead: the adapter emits a `_meta` key no
+ACP variant claims, and a downstream patch reads it. The adapter half already
+ships — a `think` tool call titled "Compact conversation" carrying
+`_meta.contextCompaction`. Without this patch it renders as a generic tool row,
+which is a working feature; this replaces that row with the native entry.
+
+**The version field is the whole degradation mechanism.** A payload that is not
+an object, carries no version, or names a version this Zed does not know is not
+interpreted — it falls through to the ordinary tool path untouched. That is what
+makes the two halves independently releasable in both directions: a newer adapter
+against an older Zed degrades to a generic row, an older adapter against a newer
+Zed never sends the key. Guessing at an unknown version is exactly what having a
+version is meant to prevent.
+
+**Both frames are intercepted at the same seam, and that is load-bearing.**
+`update_tool_call` fabricates a `Failed` row reading "Tool call not found" for an
+id it cannot match. Consuming the opening `tool_call` into a native entry while
+letting the terminal `tool_call_update` fall through would therefore hang a bogus
+failure beside the entry it just created. Both arms of `handle_session_update`
+check first, and returning `false` is the only way through to the original call —
+so the degraded path is the untouched upstream code, not a second implementation
+of it.
+
+**The derived id is namespaced: `_claude/compaction:<toolCallId>`.**
+`push_context_compaction` replaces the entry whose id matches, and Zed's own
+compaction path writes ids into the same space (a bare `Uuid`, or
+`replay-compaction-<n>`). An id taken verbatim from the adapter could therefore
+overwrite a native compaction that happened to spell itself the same way. The
+`_claude/` marker is the one this codebase already uses for an adapter extension
+that is not ACP; the colon is a separator neither native generator emits; and it
+stays a prefix rather than a hash so the id greps back to its origin in a live
+session.
+
+Interception happens in `handle_session_update`, which is where an external
+adapter's notifications arrive. Zed's native agent calls `upsert_tool_call` and
+`update_tool_call` directly and never passes through here, so the native
+compaction path cannot be disturbed by any of this.
+
+Two boundaries, stated rather than left to be discovered. `ToolCallStatus::Failed`
+maps to `ContextCompactionStatus::Canceled` because the crate's enum has no
+`Failed` and `Canceled` is the terminal that claims the least. And the payload's
+optional facts — trigger, token counts, duration — are read only for the version
+gate: this patch routes, it does not render facts. The consequence is real and
+worth knowing before looking at it live: the generic row rendered the adapter's
+`rawOutput` token counts, and the native entry with no summary does not, so the
+user gains the affordance and loses the counts. Rendering them is a follow-up.
+
+Tests: ten cases, six of them guards that were green before this patch and had to
+stay green — an unknown version degrades, an unversioned or malformed payload
+degrades without panicking, a failed lifecycle leaves nothing claiming to be in
+progress, and a `think` call merely titled "Compact conversation" with no `_meta`
+is not a compaction.
+
+Verified: `cargo test -p acp_thread` 149 passed, `cargo check -p agent_ui` clean,
+`cargo clippy -p acp_thread --all-targets` and `--all-features -- --deny warnings`
+both zero.
+---
+
+diff --git a/crates/acp_thread/src/acp_thread.rs b/crates/acp_thread/src/acp_thread.rs
+index 4686b00..e2dcc35 100644
+--- a/crates/acp_thread/src/acp_thread.rs
++++ b/crates/acp_thread/src/acp_thread.rs
+@@ -785,6 +785,30 @@ pub struct ContextCompactionUpdate {
+     pub status: Option<ContextCompactionStatus>,
+ }
+ 
++/// The `_meta` key the ACP adapter hangs context-compaction facts off.
++///
++/// An adapter extension, not ACP: the `agent-client-protocol` version this Zed links
++/// carries no compaction variant at all, so a compaction is reported as an ordinary
++/// `think` tool call and the facts ride in `_meta` — the shape `_claude/rateLimit`
++/// already uses. The seam is this key, never the title or the kind.
++const CONTEXT_COMPACTION_META_KEY: &str = "contextCompaction";
++
++/// The only payload schema this Zed knows how to read.
++///
++/// A payload announcing anything else is left to render as the generic tool row it
++/// already is. That is what makes the two halves independently releasable in both
++/// directions: a newer adapter against this Zed degrades, an older one never sends
++/// the key.
++const CONTEXT_COMPACTION_META_VERSION: u64 = 1;
++
++/// Keeps an id derived from a tool call out of the namespace the provider-native
++/// compaction path writes into.
++///
++/// `push_context_compaction` replaces the entry whose id matches, so without this an
++/// adapter-reported compaction would silently overwrite an unrelated native one that
++/// happens to spell its id the same way.
++const CONTEXT_COMPACTION_ID_PREFIX: &str = "_claude/compaction:";
++
+ impl AgentThreadEntry {
+     pub fn is_indented(&self) -> bool {
+         match self {
+@@ -2866,10 +2890,24 @@ impl AcpThread {
+                 );
+             }
+             acp::SessionUpdate::ToolCall(tool_call) => {
+-                self.upsert_tool_call(tool_call, cx)?;
++                if !self.take_context_compaction_frame(
++                    &tool_call.tool_call_id,
++                    Some(tool_call.status),
++                    tool_call.meta.as_ref(),
++                    cx,
++                ) {
++                    self.upsert_tool_call(tool_call, cx)?;
++                }
+             }
+             acp::SessionUpdate::ToolCallUpdate(tool_call_update) => {
+-                self.update_tool_call(tool_call_update, cx)?;
++                if !self.take_context_compaction_frame(
++                    &tool_call_update.tool_call_id,
++                    tool_call_update.fields.status,
++                    tool_call_update.meta.as_ref(),
++                    cx,
++                ) {
++                    self.update_tool_call(tool_call_update, cx)?;
++                }
+             }
+             acp::SessionUpdate::Plan(plan) => {
+                 self.update_plan(plan, cx);
+@@ -3343,6 +3381,72 @@ impl AcpThread {
+         cx.emit(AcpThreadEvent::EntryUpdated(ix));
+     }
+ 
++    /// Routes an adapter-reported compaction into the native entry, reporting whether
++    /// this frame was one.
++    ///
++    /// `false` means it is an ordinary tool call and must render as one — including
++    /// when the payload announces a schema version this Zed does not know, which is the
++    /// whole point of the version field.
++    ///
++    /// Every frame of the lifecycle has to be caught here, not just the opening one:
++    /// `update_tool_call` fabricates a "Tool call not found" failed row for an id it
++    /// cannot find, so intercepting only the opening `tool_call` would leave a bogus row
++    /// beside the compaction.
++    fn take_context_compaction_frame(
++        &mut self,
++        tool_call_id: &acp::ToolCallId,
++        status: Option<acp::ToolCallStatus>,
++        meta: Option<&acp::Meta>,
++        cx: &mut Context<Self>,
++    ) -> bool {
++        let Some(payload) = meta.and_then(|meta| meta.get(CONTEXT_COMPACTION_META_KEY)) else {
++            return false;
++        };
++        // Anything but the one version we know — a payload that is not an object, or
++        // carries no version, or names a newer one — cannot be interpreted, and guessing
++        // is what the version field exists to prevent.
++        if payload.get("version").and_then(|version| version.as_u64())
++            != Some(CONTEXT_COMPACTION_META_VERSION)
++        {
++            return false;
++        }
++
++        let id =
++            ContextCompactionId(format!("{CONTEXT_COMPACTION_ID_PREFIX}{tool_call_id}").into());
++        let status = match status {
++            Some(acp::ToolCallStatus::Completed) => ContextCompactionStatus::Completed,
++            // The native entry has no failure state, so a failed compaction takes the
++            // terminal that claims the least: it stopped, and it did not finish.
++            Some(acp::ToolCallStatus::Failed) => ContextCompactionStatus::Canceled,
++            Some(_) => ContextCompactionStatus::InProgress,
++            // A frame with no status is the enrichment the adapter sends after the
++            // terminal one: facts, not a phase, so the phase already recorded stands.
++            // With no lifecycle to enrich there is nothing to record, though the frame
++            // is still consumed so that it cannot fabricate a failed tool row.
++            None => match self.entries.iter().rev().find_map(|entry| match entry {
++                AgentThreadEntry::ContextCompaction(compaction) if compaction.id == id => {
++                    Some(compaction.status)
++                }
++                _ => None,
++            }) {
++                Some(recorded) => recorded,
++                None => return true,
++            },
++        };
++
++        // Replaces the entry already carrying this id, which is what keeps one
++        // lifecycle to one entry rather than one entry per frame.
++        self.push_context_compaction(
++            ContextCompaction {
++                id,
++                status,
++                summary: None,
++            },
++            cx,
++        );
++        true
++    }
++
+     pub fn can_set_title(&mut self, cx: &mut Context<Self>) -> bool {
+         self.connection.set_title(&self.session_id, cx).is_some()
+     }
+@@ -10573,6 +10677,474 @@ mod tests {
+             assert_eq!(usage.max_tokens, 10000);
+         });
+     }
++    #[gpui::test]
++    async fn context_compaction_meta_renders_as_a_native_entry(cx: &mut TestAppContext) {
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
++            })
++            .await
++            .unwrap();
++
++        thread.update(cx, |thread, cx| {
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCall(compaction_tool_call(
++                        "compaction-1",
++                        acp::ToolCallStatus::InProgress,
++                        serde_json::json!({ "version": 1, "trigger": "manual" }),
++                    )),
++                    cx,
++                )
++                .unwrap();
++        });
++
++        thread.read_with(cx, |thread, _| {
++            assert_eq!(
++                compaction_entries(thread).len(),
++                1,
++                "a recognised _meta.contextCompaction must produce the native entry"
++            );
++            assert!(
++                compaction_entries(thread)[0].is_in_progress(),
++                "an in_progress compaction is in progress"
++            );
++            assert!(
++                tool_call_entries(thread).is_empty(),
++                "the native entry replaces the generic tool row rather than joining it"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn context_compaction_lifecycle_stays_one_entry(cx: &mut TestAppContext) {
++        // The converse hostile half (wrongly SPLITTING): one compaction is reported as an
++        // opening `tool_call` and a terminal `tool_call_update` carrying the same
++        // toolCallId. If the terminal is not intercepted on the same seam, it reaches
++        // `update_tool_call`, finds no tool row with that id, and fabricates a
++        // "Tool call not found" FAILED row next to a compaction stuck in progress.
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
++            })
++            .await
++            .unwrap();
++
++        thread.update(cx, |thread, cx| {
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCall(compaction_tool_call(
++                        "compaction-1",
++                        acp::ToolCallStatus::InProgress,
++                        serde_json::json!({ "version": 1 }),
++                    )),
++                    cx,
++                )
++                .unwrap();
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCallUpdate(compaction_tool_call_update(
++                        "compaction-1",
++                        Some(acp::ToolCallStatus::Completed),
++                        serde_json::json!({
++                            "version": 1,
++                            "preTokens": 120_000,
++                            "postTokens": 20_000,
++                            "durationMs": 4_200,
++                        }),
++                    )),
++                    cx,
++                )
++                .unwrap();
++        });
++
++        thread.read_with(cx, |thread, _| {
++            assert_eq!(
++                thread.entries().len(),
++                1,
++                "one compaction is one entry, whatever the frame count: entries were {:?}",
++                thread.entries()
++            );
++            let compaction = compaction_entries(thread)
++                .pop()
++                .expect("the terminal update must land on the native entry");
++            assert_eq!(compaction.status, ContextCompactionStatus::Completed);
++        });
++    }
++
++    #[gpui::test]
++    async fn two_compactions_in_one_turn_stay_two_entries(cx: &mut TestAppContext) {
++        // The hostile half (wrongly COLLAPSING): one model turn can legitimately compact
++        // more than once, and the adapter opens a new lifecycle with a new tool call id
++        // for the second. Two compactions must stay two reports.
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
++            })
++            .await
++            .unwrap();
++
++        thread.update(cx, |thread, cx| {
++            for id in ["compaction-1", "compaction-2"] {
++                thread
++                    .handle_session_update(
++                        acp::SessionUpdate::ToolCall(compaction_tool_call(
++                            id,
++                            acp::ToolCallStatus::Completed,
++                            serde_json::json!({ "version": 1, "trigger": "automatic" }),
++                        )),
++                        cx,
++                    )
++                    .unwrap();
++            }
++        });
++
++        thread.read_with(cx, |thread, _| {
++            assert_eq!(
++                compaction_entries(thread).len(),
++                2,
++                "two compactions in one turn are two entries"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn adapter_compaction_does_not_displace_a_native_one(cx: &mut TestAppContext) {
++        // The derived value, asked about a THIRD element. The patch invents a
++        // `ContextCompactionId` from the adapter's toolCallId, and that id lands in a
++        // namespace Zed's own compaction path already writes into —
++        // `push_context_compaction` REPLACES the entry whose id matches (:3240). A
++        // provider-native compaction and an adapter-reported one that happen to spell
++        // their id the same way are still two different compactions, and the first must
++        // not vanish. Namespacing the derived id is the cheap way out; this test does not
++        // dictate which.
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
++            })
++            .await
++            .unwrap();
++
++        thread.update(cx, |thread, cx| {
++            thread.push_context_compaction(
++                ContextCompaction {
++                    id: ContextCompactionId("compaction-1".into()),
++                    status: ContextCompactionStatus::Completed,
++                    summary: None,
++                },
++                cx,
++            );
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCall(compaction_tool_call(
++                        "compaction-1",
++                        acp::ToolCallStatus::Completed,
++                        serde_json::json!({ "version": 1 }),
++                    )),
++                    cx,
++                )
++                .unwrap();
++        });
++
++        thread.read_with(cx, |thread, _| {
++            assert_eq!(
++                compaction_entries(thread).len(),
++                2,
++                "an adapter-reported compaction must not overwrite an unrelated native one \
++                 that spells its id the same way"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn failed_compaction_does_not_leave_an_entry_in_progress(cx: &mut TestAppContext) {
++        // A failed lifecycle is `status: failed` plus `_meta.error`. The native entry has
++        // no failure state (InProgress | Completed | Canceled), so which terminal it maps
++        // to is the patch's call — what it may NOT do is leave the entry claiming the
++        // compaction is still running, which is what happens if only the opening frame is
++        // intercepted.
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
++            })
++            .await
++            .unwrap();
++
++        thread.update(cx, |thread, cx| {
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCall(compaction_tool_call(
++                        "compaction-1",
++                        acp::ToolCallStatus::InProgress,
++                        serde_json::json!({ "version": 1 }),
++                    )),
++                    cx,
++                )
++                .unwrap();
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCallUpdate(compaction_tool_call_update(
++                        "compaction-1",
++                        Some(acp::ToolCallStatus::Failed),
++                        serde_json::json!({ "version": 1, "error": "compaction failed" }),
++                    )),
++                    cx,
++                )
++                .unwrap();
++        });
++
++        thread.read_with(cx, |thread, _| {
++            assert!(
++                !compaction_entries(thread)
++                    .iter()
++                    .any(|compaction| compaction.is_in_progress()),
++                "a compaction that failed is not still running"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn unknown_compaction_version_falls_through_to_generic_rendering(
++        cx: &mut TestAppContext,
++    ) {
++        // D3, and the reason the version field exists at all: a newer adapter against an
++        // older Zed must degrade rather than be interpreted by a reader that does not know
++        // the payload. Green before the patch and green after it — and it must not panic,
++        // which is what makes the two halves independently releasable in both directions.
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
++            })
++            .await
++            .unwrap();
++
++        thread.update(cx, |thread, cx| {
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCall(compaction_tool_call(
++                        "compaction-future",
++                        acp::ToolCallStatus::Completed,
++                        serde_json::json!({ "version": 2, "trigger": "manual" }),
++                    )),
++                    cx,
++                )
++                .unwrap();
++        });
++
++        thread.read_with(cx, |thread, _| {
++            assert!(
++                compaction_entries(thread).is_empty(),
++                "a version this Zed does not know cannot be interpreted"
++            );
++            assert_eq!(
++                tool_call_entries(thread).len(),
++                1,
++                "it degrades to the generic tool row, which is a working feature on its own"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn unversioned_compaction_meta_is_not_interpretable(cx: &mut TestAppContext) {
++        // A payload with no version is a payload a reader cannot degrade from, so it can
++        // only be guessed at. Same for a version that is not the number the contract says
++        // it is, and for a `_meta.contextCompaction` that is not an object at all — none
++        // of which may panic. Green today and it must stay green.
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
++            })
++            .await
++            .unwrap();
++
++        thread.update(cx, |thread, cx| {
++            for (id, payload) in [
++                ("no-version", serde_json::json!({ "trigger": "manual" })),
++                ("string-version", serde_json::json!({ "version": "1" })),
++                ("null-version", serde_json::json!({ "version": null })),
++                ("not-an-object", serde_json::json!("compacting")),
++            ] {
++                thread
++                    .handle_session_update(
++                        acp::SessionUpdate::ToolCall(compaction_tool_call(
++                            id,
++                            acp::ToolCallStatus::Completed,
++                            payload,
++                        )),
++                        cx,
++                    )
++                    .unwrap();
++            }
++        });
++
++        thread.read_with(cx, |thread, _| {
++            assert!(
++                compaction_entries(thread).is_empty(),
++                "an unversioned or malformed payload is not interpretable"
++            );
++            assert_eq!(
++                tool_call_entries(thread).len(),
++                4,
++                "each one still renders as the generic tool row it already is"
++            );
++        });
++    }
++
++    #[gpui::test]
++    async fn a_think_tool_call_titled_like_a_compaction_is_not_one(cx: &mut TestAppContext) {
++        // The seam is the `_meta` key, never the title or the kind. An agent — or a
++        // subagent, or a user-defined tool — that spells a think call "Compact
++        // conversation" must render as the tool call it is.
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
++            })
++            .await
++            .unwrap();
++
++        thread.update(cx, |thread, cx| {
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCall(
++                        acp::ToolCall::new(
++                            acp::ToolCallId::new("look-alike"),
++                            "Compact conversation",
++                        )
++                        .kind(acp::ToolKind::Think)
++                        .status(acp::ToolCallStatus::Completed),
++                    ),
++                    cx,
++                )
++                .unwrap();
++            thread
++                .handle_session_update(
++                    acp::SessionUpdate::ToolCall(
++                        acp::ToolCall::new(
++                            acp::ToolCallId::new("other-meta"),
++                            "Compact conversation",
++                        )
++                        .kind(acp::ToolKind::Think)
++                        .status(acp::ToolCallStatus::Completed)
++                        .meta(meta_with(
++                            "somethingElse",
++                            serde_json::json!({"version": 1}),
++                        )),
++                    ),
++                    cx,
++                )
++                .unwrap();
++        });
++
++        thread.read_with(cx, |thread, _| {
++            assert!(
++                compaction_entries(thread).is_empty(),
++                "the seam is the _meta key, not the title — classifying by title would \
++                 capture every tool call that happens to be named this way"
++            );
++            assert_eq!(tool_call_entries(thread).len(), 2);
++        });
++    }
++
++    // --- helpers for the compaction `_meta` seam ------------------------------------
++
++    /// `_meta` carrying one key, in the `serde_json::Map` shape `acp::Meta` aliases.
++    fn meta_with(
++        key: &str,
++        payload: serde_json::Value,
++    ) -> serde_json::Map<String, serde_json::Value> {
++        let mut meta = serde_json::Map::new();
++        meta.insert(key.to_string(), payload);
++        meta
++    }
++
++    /// The opening (or standalone) frame the adapter emits for a compaction: ACP kind
++    /// `think`, titled "Compact conversation", carrying `_meta.contextCompaction`.
++    fn compaction_tool_call(
++        id: &str,
++        status: acp::ToolCallStatus,
++        payload: serde_json::Value,
++    ) -> acp::ToolCall {
++        acp::ToolCall::new(acp::ToolCallId::new(id), "Compact conversation")
++            .kind(acp::ToolKind::Think)
++            .status(status)
++            .meta(meta_with("contextCompaction", payload))
++    }
++
++    /// A lifecycle update for an already-opened compaction. `status: None` is the
++    /// enrichment frame `compact_boundary` produces: facts, no second terminal.
++    fn compaction_tool_call_update(
++        id: &str,
++        status: Option<acp::ToolCallStatus>,
++        payload: serde_json::Value,
++    ) -> acp::ToolCallUpdate {
++        acp::ToolCallUpdate::new(
++            acp::ToolCallId::new(id),
++            acp::ToolCallUpdateFields::new().status(status),
++        )
++        .meta(meta_with("contextCompaction", payload))
++    }
++
++    fn compaction_entries(thread: &AcpThread) -> Vec<&ContextCompaction> {
++        thread
++            .entries()
++            .iter()
++            .filter_map(|entry| match entry {
++                AgentThreadEntry::ContextCompaction(compaction) => Some(compaction),
++                _ => None,
++            })
++            .collect()
++    }
++
++    fn tool_call_entries(thread: &AcpThread) -> Vec<&ToolCall> {
++        thread
++            .entries()
++            .iter()
++            .filter_map(|entry| match entry {
++                AgentThreadEntry::ToolCall(tool_call) => Some(tool_call),
++                _ => None,
++            })
++            .collect()
++    }
+ 
+     #[gpui::test]
+     async fn test_usage_update_without_cost_preserves_existing_cost(cx: &mut TestAppContext) {
