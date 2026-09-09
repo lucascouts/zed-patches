@@ -3,5 +3,8 @@ work/
 *.orig
 *.rej
 
+# live-proof.py is the first Python here; its bytecode cache is not source.
+__pycache__/
+
 # local overlay pointer (per-machine path)
 .zp-overlay
