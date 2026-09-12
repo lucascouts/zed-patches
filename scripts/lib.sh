@@ -267,6 +267,58 @@ _zp_advisory_detail() {
 	done <<<"$1"
 }
 
+# _zp_advisory_workspace_shadows <cargo-lock> — name the crates an advisory can
+# be reported against and be WRONG about: those the workspace defines itself.
+#
+# osv-scanner matches a Cargo.lock entry to the OSV database by NAME AND VERSION
+# ALONE. A workspace member is written into the lock file exactly like a
+# registry dependency except for one missing field -- it has no `source =` --
+# and the scanner does not read that field. So a local crate whose name and
+# version happen to collide with a published one inherits that crate's
+# advisories wholesale.
+#
+# This is not hypothetical and it is not harmless. Measured 2026-09-11 against
+# the packaged Zed: `telemetry 0.1.0` is a workspace member with no `source`,
+# and it was being reported as GHSA-hpcx-3pw8-g3j2 at **CVSS 9.8** -- the single
+# most severe line in the whole report, and the first one a reader's eye lands
+# on. Nothing in the scanner's output distinguishes it from the real findings
+# beneath it, and a 9.8 nobody can act on teaches people to skip the list.
+#
+# Prints nothing when no reported package is local, which is the common case.
+_zp_advisory_workspace_shadows() {
+	local lock="$1" report="$2" name local_crates=() shadowed=()
+
+	[[ -f "${lock}" && -n "${report}" ]] || return 0
+
+	# A [[package]] stanza with no `source =` line before the next stanza is a
+	# workspace member. awk over the stanza is enough; no TOML parser is needed
+	# for a file Cargo writes in a fixed shape.
+	mapfile -t local_crates < <(
+		awk '
+			/^\[\[package\]\]/ { name = ""; has_source = 0; next }
+			/^name = / { gsub(/^name = "|"$/, ""); name = $0; next }
+			/^source = / { has_source = 1; next }
+			/^$/ { if (name != "" && !has_source) print name; name = "" }
+			END { if (name != "" && !has_source) print name }
+		' "${lock}"
+	)
+
+	for name in "${local_crates[@]}"; do
+		[[ -n "${name}" ]] || continue
+		# The report tabulates one package per row; match the name in its column.
+		if grep -qE "\| ${name} +\|" <<<"${report}"; then
+			shadowed+=("${name}")
+		fi
+	done
+
+	((${#shadowed[@]} > 0)) || return 0
+
+	_zp_advisory_line 'FALSE POS' "${#shadowed[@]} reported crate(s) are workspace members, not crates.io:"
+	_zp_advisory_detail "$(printf '%s\n' "${shadowed[@]}")"
+	_zp_advisory_detail "osv-scanner matches on name+version and ignores the absent 'source' field."
+	_zp_advisory_detail "Their advisories belong to the published crate of the same name. Ignore them."
+}
+
 # _zp_scan_lockfile <lockfile> <chain-root> — scan one lockfile, print its
 # verdict, and return 0 whatever the answer was.
 _zp_scan_lockfile() {
@@ -299,6 +351,10 @@ _zp_scan_lockfile() {
 		if [[ -n "${out}" ]]; then
 			_zp_advisory_line findings "${label}"
 			_zp_advisory_detail "${out}"
+			# Directly under the report, where someone reading the findings is
+			# already looking. Named crates only, and only when the lock file
+			# says so — see the function for what it costs to leave this unsaid.
+			_zp_advisory_workspace_shadows "${path}" "${out}"
 		else
 			_zp_advisory_line 'scan failed' "${label} — exit 1 with no report"
 		fi
