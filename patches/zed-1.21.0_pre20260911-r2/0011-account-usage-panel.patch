@@ -460,10 +460,10 @@ index bef45ba..fcd278c 100644
              | AcpThreadEvent::EntriesRemoved(_)
              | AcpThreadEvent::ToolAuthorizationRequested(_)
 diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
-index 43dbed6..f5f05e3 100644
+index 11cb61f..528e5d2 100644
 --- a/crates/agent_ui/src/conversation_view.rs
 +++ b/crates/agent_ui/src/conversation_view.rs
-@@ -324,6 +324,7 @@ impl Conversation {
+@@ -331,6 +331,7 @@ impl Conversation {
                      | AcpThreadEvent::StatusChanged
                      | AcpThreadEvent::TitleUpdated
                      | AcpThreadEvent::TokenUsageUpdated
@@ -471,7 +471,7 @@ index 43dbed6..f5f05e3 100644
                      | AcpThreadEvent::EntryUpdated(_)
                      | AcpThreadEvent::EntriesRemoved(_)
                      | AcpThreadEvent::Retry(_)
-@@ -586,6 +587,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
+@@ -593,6 +594,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
          | AcpThreadEvent::EntriesRemoved(_)
          | AcpThreadEvent::Retry(_)
          | AcpThreadEvent::TokenUsageUpdated
@@ -479,7 +479,7 @@ index 43dbed6..f5f05e3 100644
          | AcpThreadEvent::PromptCapabilitiesUpdated
          | AcpThreadEvent::AvailableCommandsUpdated(_)
          | AcpThreadEvent::ModeUpdated(_)
-@@ -1832,6 +1834,13 @@ impl ConversationView {
+@@ -1839,6 +1841,13 @@ impl ConversationView {
                      });
                  }
              }
@@ -494,7 +494,7 @@ index 43dbed6..f5f05e3 100644
                  if let Some(thread_view) = self.thread_view(&session_id) {
                      let available_skills = thread
 diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
-index 7882baf..013beec 100644
+index 767b105..a9d7442 100644
 --- a/crates/agent_ui/src/conversation_view/thread_view.rs
 +++ b/crates/agent_ui/src/conversation_view/thread_view.rs
 @@ -9,8 +9,9 @@ use agent_client_protocol::schema::v1 as acp;

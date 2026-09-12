@@ -44,7 +44,7 @@ this work lives now, and where protocol breakage is reported first.
 ---
 
 diff --git a/Cargo.lock b/Cargo.lock
-index a1fb7ca..80d7ac9 100644
+index d4b1f45..9757ed1 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -3085,6 +3085,31 @@ version = "0.7.6"
@@ -1971,10 +1971,10 @@ index d9562b6..3b33dc2 100644
  cli.workspace = true
  client.workspace = true
 diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
-index d759241..86d8759 100644
+index ec31980..d5e7135 100644
 --- a/crates/zed/src/main.rs
 +++ b/crates/zed/src/main.rs
-@@ -698,6 +698,7 @@ fn main() {
+@@ -701,6 +701,7 @@ fn main() {
          acp_tools::init(cx);
          zed::telemetry_log::init(cx);
          zed::remote_debug::init(cx);
