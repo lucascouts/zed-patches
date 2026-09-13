@@ -32,7 +32,10 @@ case "${mode}" in
 			var wins = workspace.windowList();
 			for (var i = 0; i < wins.length; i++) {
 			    var w = wins[i];
-			    if (String(w.resourceClass || "").toLowerCase().indexOf("zed") !== -1) {
+			    // "ze", not "zed": Zeo's app_id is dev.zeo.Zeo, and a "zed"
+			    // filter drops its windows while still returning a confident,
+			    // complete-looking list.
+			    if (String(w.resourceClass || "").toLowerCase().indexOf("ze") !== -1) {
 			        print("${marker}|" + w.active + "|" + String(w.caption));
 			    }
 			}
@@ -58,7 +61,7 @@ case "${mode}" in
 			var hit = null;
 			for (var i = 0; i < wins.length; i++) {
 			    var cap = String(wins[i].caption);
-			    if (String(wins[i].resourceClass || "").toLowerCase().indexOf("zed") === -1) continue;
+			    if (String(wins[i].resourceClass || "").toLowerCase().indexOf("ze") === -1) continue;
 			    var key = byProject ? cap.split("\u2014")[0].trim() : cap;
 			    if (key === want) { hit = wins[i]; break; }
 			}
