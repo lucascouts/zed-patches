@@ -43,8 +43,12 @@ Across the workspace, each site and the reasoning for its arm:
   auto_update_ui - an announcement gate whose arms are currently identical;
   recorded here so the next person does not have to re-derive that it is a no-op.
 
-  zed/src/zed.rs - the About window icon, via include_bytes! on the art added by
-  the preceding patch.
+  zed/src/zed.rs - the About window icon, via include_bytes! on
+  resources/app-icon-zeo.png. THAT FILE IS NOT ADDED BY ANY PATCH, and cannot be:
+  GNU patch refuses a git binary hunk outright - "git binary diffs are not
+  supported" - and both refresh.sh and Portage's eapply run `patch -p1`. The
+  ebuild copies the art in from FILESDIR during src_prepare, before eapply. A
+  build without that step fails here, at compile time, with a missing file.
 
 Also crates/zed/build.rs, which is NOT one of the enumerated sites and is the
 reason this needs saying: it picks the embedded window icon by matching the
