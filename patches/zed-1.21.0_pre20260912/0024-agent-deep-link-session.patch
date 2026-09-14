@@ -1,0 +1,294 @@
+From 7b26e367710b6f06dad1bbc8a8b898637b531cf4 Mon Sep 17 00:00:00 2001
+From: zed-patches <zed-patches@localhost>
+Date: Sun, 13 Sep 2026 19:38:48 -0300
+Subject: [PATCH] zed://agent?session=<id> reopens an existing thread
+
+`zed://agent` could start a conversation but never return to one. The URL
+handler accepted a single parameter, `?prompt=`, and every path through it
+ended at `new_agent_thread_with_external_source_prompt` -- so a link could
+seed a new thread and nothing could point at a thread that already existed.
+
+Everything needed to do it was already here, on both sides:
+
+  * `AgentPanel::open_thread` takes an `acp::SessionId`, resolves it through
+    `ThreadMetadataStore::entry_by_session`, and falls back to loading the
+    session when this machine has no row for it. Its own comment says "Share
+    links / clipboard imports enter with only a session id", so entering by
+    session id is a case it was written for.
+
+  * The id is not a Zed-local handle. It is the agent session id -- for an
+    ACP agent, the same id the agent itself uses. Verified against this
+    machine: two session ids out of `sidebar_threads` both have a Claude Code
+    transcript of the same name under ~/.claude/projects. So whatever produces
+    the link -- a share link, a shell script, a tray daemon reading agent hooks
+    -- needs to know nothing about Zed's internal thread ids.
+
+What was missing was the three lines of plumbing between them. This adds
+`session_id` to `OpenRequestKind::AgentPanel`, teaches `parse_agent_url` to
+read `session=`, and routes a request carrying one to `open_thread`.
+
+Two decisions worth stating, because both are silent if wrong:
+
+  * **`session` wins over `prompt`.** A link that names a thread is asking for
+    that thread; seeding a prompt into it would put words into a conversation
+    the user reopened to read. They are mutually exclusive in practice, and the
+    precedence has a test rather than a comment.
+
+  * **An empty `session=` is not a session.** `?session=&prompt=hello` would
+    otherwise resolve to no thread AND swallow the prompt -- the one input that
+    could silently do nothing at all. It falls back to the prompt path, also
+    under test.
+
+An id this machine has never seen is not an error: `open_thread` already
+handles the unknown-session case by loading it, which is what makes a link
+from another host work at all.
+
+Upstreamable as-is: it adds a parameter to an existing scheme, changes no
+default, and the behaviour it exposes was already reachable in the panel.
+---
+ crates/zed/src/main.rs              |  21 +++--
+ crates/zed/src/zed/open_listener.rs | 127 ++++++++++++++++++++++++++--
+ 2 files changed, 138 insertions(+), 10 deletions(-)
+
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index ec31980..da28f89 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -1039,6 +1039,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut
+             }
+             OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                session_id,
+             } => {
+                 cx.spawn(async move |cx| {
+                     let multi_workspace =
+@@ -1057,11 +1058,21 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut
+                         multi_workspace.workspace().update(cx, |workspace, cx| {
+                             if let Some(panel) = workspace.focus_panel::<AgentPanel>(window, cx) {
+                                 panel.update(cx, |panel, cx| {
+-                                    panel.new_agent_thread_with_external_source_prompt(
+-                                        external_source_prompt,
+-                                        window,
+-                                        cx,
+-                                    );
++                                    // A session id reopens that thread; everything
++                                    // else starts a new one. open_thread already
++                                    // resolves the id against ThreadMetadataStore
++                                    // and falls back to loading the session when
++                                    // this machine has no row for it, so an id from
++                                    // another host is not an error here.
++                                    if let Some(session_id) = session_id {
++                                        panel.open_thread(session_id, None, None, window, cx);
++                                    } else {
++                                        panel.new_agent_thread_with_external_source_prompt(
++                                            external_source_prompt,
++                                            window,
++                                            cx,
++                                        );
++                                    }
+                                 });
+                             } else {
+                                 log::warn!(
+diff --git a/crates/zed/src/zed/open_listener.rs b/crates/zed/src/zed/open_listener.rs
+index 0675fdd..09ac1d5 100644
+--- a/crates/zed/src/zed/open_listener.rs
++++ b/crates/zed/src/zed/open_listener.rs
+@@ -1,5 +1,6 @@
+ use crate::handle_open_request;
+ use crate::restore_or_create_workspace;
++use agent_client_protocol::schema::v1 as acp;
+ use agent_ui::ExternalSourcePrompt;
+ use anyhow::{Context as _, Result, anyhow};
+ use cli::{CliRequest, CliResponse, CliResponseSink};
+@@ -59,6 +60,14 @@ pub enum OpenRequestKind {
+     },
+     AgentPanel {
+         external_source_prompt: Option<ExternalSourcePrompt>,
++        /// Open this existing thread instead of starting a new one.
++        ///
++        /// The id is the agent session id, which is what `AgentPanel::open_thread`
++        /// already resolves against `ThreadMetadataStore`. It is deliberately the
++        /// same identifier the agent itself uses, so whatever produced the link --
++        /// a share link, a shell script, a notification -- does not have to know
++        /// anything about Zed's local thread ids.
++        session_id: Option<acp::SessionId>,
+     },
+     InstallSkill {
+         /// Full `SKILL.md` contents embedded in a `zed://skill` share link.
+@@ -93,9 +102,11 @@ impl std::fmt::Debug for OpenRequestKind {
+                 .finish(),
+             Self::AgentPanel {
+                 external_source_prompt,
++                session_id,
+             } => f
+                 .debug_struct("AgentPanel")
+                 .field("external_source_prompt", external_source_prompt)
++                .field("session_id", session_id)
+                 .finish(),
+             Self::InstallSkill { content } => f
+                 .debug_struct("InstallSkill")
+@@ -221,15 +232,33 @@ impl OpenRequest {
+     }
+ 
+     fn parse_agent_url(&mut self, agent_path: &str) {
+-        // Format: "" or "?prompt=<text>".
++        // Format: "", "?prompt=<text>" or "?session=<id>".
++        //
++        // The two are mutually exclusive in practice and `session` wins: a link
++        // that names an existing thread is asking for that thread, and seeding a
++        // prompt into it would put words in a conversation the user did not
++        // reopen to extend.
+         let agent_path = agent_path.strip_prefix('/').unwrap_or(agent_path);
+-        let external_source_prompt = agent_path.strip_prefix('?').and_then(|query| {
+-            url::form_urlencoded::parse(query.as_bytes())
+-                .find_map(|(key, value)| (key == "prompt").then_some(value))
+-                .and_then(|prompt| ExternalSourcePrompt::new(prompt.as_ref()))
++        let query = agent_path.strip_prefix('?');
++
++        let session_id = query.and_then(|query| {
++            url::form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
++                (key == "session" && !value.trim().is_empty())
++                    .then(|| acp::SessionId::new(value.trim()))
++            })
+         });
++
++        let external_source_prompt = session_id.is_none().then(|| {
++            query.and_then(|query| {
++                url::form_urlencoded::parse(query.as_bytes())
++                    .find_map(|(key, value)| (key == "prompt").then_some(value))
++                    .and_then(|prompt| ExternalSourcePrompt::new(prompt.as_ref()))
++            })
++        }).flatten();
++
+         self.kind = Some(OpenRequestKind::AgentPanel {
+             external_source_prompt,
++            session_id,
+         });
+     }
+ 
+@@ -1487,6 +1516,7 @@ mod tests {
+         match request.kind {
+             Some(OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                ..
+             }) => {
+                 assert_eq!(external_source_prompt, None);
+             }
+@@ -1565,6 +1595,7 @@ mod tests {
+         match request.kind {
+             Some(OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                ..
+             }) => {
+                 assert_eq!(
+                     external_source_prompt
+@@ -1595,6 +1626,7 @@ mod tests {
+         match request.kind {
+             Some(OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                ..
+             }) => {
+                 assert_eq!(
+                     external_source_prompt
+@@ -1652,6 +1684,7 @@ mod tests {
+         match request.kind {
+             Some(OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                ..
+             }) => {
+                 assert_eq!(external_source_prompt, None);
+             }
+@@ -1659,6 +1692,90 @@ mod tests {
+         }
+     }
+ 
++    #[gpui::test]
++    fn test_parse_agent_url_with_session(cx: &mut TestAppContext) {
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec!["zed://agent?session=abc-123".into()],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++
++        match request.kind {
++            Some(OpenRequestKind::AgentPanel {
++                session_id,
++                external_source_prompt,
++            }) => {
++                assert_eq!(session_id.as_ref().map(|id| id.0.as_ref()), Some("abc-123"));
++                assert_eq!(external_source_prompt, None);
++            }
++            _ => panic!("Expected AgentPanel kind"),
++        }
++    }
++
++    /// A link that names a thread is asking for that thread. Seeding a prompt
++    /// into it would put words into a conversation the user reopened to read.
++    #[gpui::test]
++    fn test_parse_agent_url_session_wins_over_prompt(cx: &mut TestAppContext) {
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec!["zed://agent?session=abc-123&prompt=hello".into()],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++
++        match request.kind {
++            Some(OpenRequestKind::AgentPanel {
++                session_id,
++                external_source_prompt,
++            }) => {
++                assert_eq!(session_id.as_ref().map(|id| id.0.as_ref()), Some("abc-123"));
++                assert_eq!(external_source_prompt, None);
++            }
++            _ => panic!("Expected AgentPanel kind"),
++        }
++    }
++
++    /// An empty value is not a session: it would resolve to no thread and
++    /// silently swallow a prompt that was also supplied.
++    #[gpui::test]
++    fn test_parse_agent_url_with_empty_session(cx: &mut TestAppContext) {
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec!["zed://agent?session=&prompt=hello".into()],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++
++        match request.kind {
++            Some(OpenRequestKind::AgentPanel {
++                session_id,
++                external_source_prompt,
++            }) => {
++                assert_eq!(session_id, None);
++                assert_eq!(
++                    external_source_prompt
++                        .as_ref()
++                        .map(ExternalSourcePrompt::as_str),
++                    Some("hello")
++                );
++            }
++            _ => panic!("Expected AgentPanel kind"),
++        }
++    }
++
+     #[gpui::test]
+     fn test_parse_git_commit_url(cx: &mut TestAppContext) {
+         let _app_state = init_test(cx);
+-- 
+2.55.0
+

@@ -1,0 +1,277 @@
+From dd0b6eb6db270221b6cacafba91f3ead7a919ba9 Mon Sep 17 00:00:00 2001
+From: lucascouts <diego.evangelista5642@gmail.com>
+Date: Sat, 5 Sep 2026 20:48:07 -0300
+Subject: [PATCH] feat(agent_ui): let a user copy their own message
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The text was already there. `get_agent_message_content` returned `None` for
+`AgentThreadEntry::UserMessage` before it did anything else, and the string it
+would have produced is one the editor path already builds: the LostFocus handler
+compares the editor's contents against `ContentBlock::to_markdown` on every blur.
+This reaches that serialisation instead of adding a second one.
+
+Deliberately **not** `UserMessage::to_markdown`, which prefixes `## User` for the
+transcript — that heading belongs in a transcript, not in someone's clipboard.
+
+**The branch answers before the walks, not after.** The body that follows scans
+backwards to the nearest user message to bound an agent's span; a user-message
+case that fell through to it would answer with the *preceding* message whenever a
+thread has more than one. Two of the tests exist for exactly that, and for its
+mirror — the agent branch must not widen to swallow the user's text.
+
+**The button is part of the change, not a follow-up.** The machinery alone
+satisfies nothing a user can observe: both callers of the function are gated to
+assistant indices, so without an entry point this would have been code that ships
+and changes nothing. It goes on the shared container **before** the
+editable/non-editable branch, so both states carry it — copying matters most
+where editing is unavailable, which is the state with no other way to get the
+text out, and it is the state every subagent message is in.
+
+Two consequences worth knowing before looking for it on screen. The container
+lives inside a focus gate, so the toolbar — copy along with cancel, regenerate
+and the non-editable indicator — appears when that message's editor is focused;
+copy is two clicks, and the first also focuses an editor. And the button's
+`disabled` and its click handler call the same function, so what it offers and
+what it copies cannot drift apart.
+
+Also here, and named rather than smuggled: one `.into()` dropped at
+`thread_view.rs:4764`. `0013` widened `AccountUsageWindowKind::label()` to
+`SharedString` and left that call site converting a type to itself, so `agent_ui`
+stopped linting clean. It is absorbed here because rebasing a committed patch
+costs more than a one-word fix, not because it belongs to this change.
+
+Known and left alone: `get_agent_message_content` and the menu label "Copy This
+Agent Response" both say *agent* while the function now serves both kinds.
+Harmless today — that menu never opens over a user message — and renaming a
+function with two other callers would enlarge what `refresh.sh` re-resolves at
+every Zed bump for no behavioural gain.
+
+Tests: four cases, including the two hostile halves — the second user message
+must answer with its own text, and the agent branch must return exactly its own
+span. An empty message stays uncopyable.
+
+Verified: `cargo check -p agent_ui`, `cargo test -p agent_ui --lib` (7 passed),
+`cargo clippy -p agent_ui --all-targets` (zero diagnostics), `rustfmt --check`
+(exit 0). The button itself is compile-verified, not render-verified — no test in
+this crate drives `render_entry`, so that it appears and writes to the clipboard
+is checked in a running Zed, not here.
+---
+
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index a9d7442..d76af73 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -4761,7 +4761,7 @@ impl ThreadView {
+                     .map(|window| {
+                         let ratio = window.utilization.unwrap_or(0.0);
+                         AccountUsageRow {
+-                            label: window.kind.label().into(),
++                            label: window.kind.label(),
+                             percentage: window
+                                 .utilization
+                                 .map(|u| format!("{}%", (u * 100.0).round() as u32))
+@@ -6399,7 +6399,35 @@ impl ThreadView {
+                                     .border_1()
+                                     .border_color(cx.theme().colors().border)
+                                     .bg(cx.theme().colors().editor_background)
+-                                    .overflow_hidden();
++                                    .overflow_hidden()
++                                    // On the shared container, before the editable
++                                    // branch, so it exists in both states: copying
++                                    // matters most where editing is unavailable, which
++                                    // is the state with no other way to get the text
++                                    // out. `disabled` and the click read the same
++                                    // function, so what the button offers and what it
++                                    // copies cannot disagree.
++                                    .child(
++                                        IconButton::new("copy_user_message", IconName::Copy)
++                                            .disabled(Self::get_agent_message_content(
++                                                self.thread.read(cx).entries(),
++                                                entry_ix,
++                                                cx,
++                                            ).is_none())
++                                            .icon_color(Color::Muted)
++                                            .icon_size(IconSize::XSmall)
++                                            .tooltip(Tooltip::text("Copy Message"))
++                                            .on_click(cx.listener(move |this, _, _, cx| {
++                                                let entries = this.thread.read(cx).entries();
++                                                if let Some(text) = Self::get_agent_message_content(
++                                                    entries, entry_ix, cx,
++                                                ) {
++                                                    cx.write_to_clipboard(
++                                                        ClipboardItem::new_string(text),
++                                                    );
++                                                }
++                                            })),
++                                    );
+ 
+                                 let is_loading_contents = self.is_loading_contents;
+                                 if is_editable {
+@@ -7855,8 +7883,14 @@ impl ThreadView {
+         cx: &App,
+     ) -> Option<String> {
+         let entry = entries.get(entry_index)?;
+-        if matches!(entry, AgentThreadEntry::UserMessage(_)) {
+-            return None;
++        // A user message copies the string the edit path already serialises for it:
++        // `ContentBlock::to_markdown`, what the LostFocus handler compares the editor
++        // against -- not `UserMessage::to_markdown`, which prefixes "## User" for the
++        // transcript. It answers here because the walk below runs backwards, to bound
++        // an agent's span, and would answer with the preceding message.
++        if let AgentThreadEntry::UserMessage(message) = entry {
++            let text = message.content.to_markdown(cx);
++            return (!text.trim().is_empty()).then(|| text.to_string());
+         }
+ 
+         let start_index = (0..entry_index)
+@@ -12871,6 +12905,148 @@ mod tests {
+             acp_thread::CommandCategory::Mcp,
+         ))
+     }
++    fn conversation_entries(cx: &mut App) -> Vec<acp_thread::AgentThreadEntry> {
++        let languages = Arc::new(language::LanguageRegistry::test(
++            cx.background_executor().clone(),
++        ));
++        let path_style = util::paths::PathStyle::local();
++
++        let user = |text: &str, cx: &mut App| {
++            acp_thread::AgentThreadEntry::UserMessage(acp_thread::UserMessage {
++                protocol_id: None,
++                client_id: None,
++                is_optimistic: false,
++                content: acp_thread::ContentBlock::new(text.into(), &languages, path_style, cx),
++                chunks: vec![text.into()],
++                checkpoint: None,
++                indented: false,
++            })
++        };
++        let agent = |text: &str, cx: &mut App| {
++            acp_thread::AgentThreadEntry::AssistantMessage(acp_thread::AssistantMessage {
++                chunks: vec![acp_thread::AssistantMessageChunk::from_str(
++                    text, &languages, path_style, cx,
++                )],
++                indented: false,
++                is_subagent_output: false,
++            })
++        };
++
++        vec![
++            user("Refactor `parse_args` to return a Result", cx),
++            agent("Done - it now returns `Result<Args, ParseError>`.", cx),
++            user("Now document the error variants", cx),
++            agent("Documented all four variants.", cx),
++        ]
++    }
++
++    /// The string the edit path serialises for the user message at `index`.
++    fn edited_text(entries: &[acp_thread::AgentThreadEntry], index: usize, cx: &App) -> String {
++        match &entries[index] {
++            acp_thread::AgentThreadEntry::UserMessage(message) => {
++                message.content.to_markdown(cx).to_string()
++            }
++            other => panic!("entry {index} is not a user message: {other:?}"),
++        }
++    }
++
++    #[gpui::test]
++    fn copy_yields_the_users_own_message(cx: &mut gpui::TestAppContext) {
++        cx.update(|cx| {
++            let entries = conversation_entries(cx);
++            let expected = edited_text(&entries, 0, cx);
++
++            let copied = ThreadView::get_agent_message_content(&entries, 0, cx)
++                .expect("the user's own message must be copyable");
++
++            assert_eq!(
++                copied, expected,
++                "the copy path must yield the text the edit path already serialises"
++            );
++            assert!(
++                !copied.contains("Result<Args"),
++                "copying a user message must not drag the agent's reply in with it: {copied:?}"
++            );
++        });
++    }
++
++    #[gpui::test]
++    fn copy_yields_the_user_message_that_was_asked_for(cx: &mut gpui::TestAppContext) {
++        // The hostile half (wrongly COLLAPSING): two user messages in one thread are two
++        // different messages. The existing body walks BACKWARDS to the nearest user
++        // message to find the start of an agent span; a user branch that reuses that walk
++        // answers with the wrong message, or with the whole conversation.
++        cx.update(|cx| {
++            let entries = conversation_entries(cx);
++            let expected = edited_text(&entries, 2, cx);
++
++            let copied = ThreadView::get_agent_message_content(&entries, 2, cx)
++                .expect("the second user message must be copyable too");
++
++            assert_eq!(copied, expected);
++            assert!(
++                !copied.contains("Refactor `parse_args`"),
++                "the FIRST user message is a different message: {copied:?}"
++            );
++            assert!(
++                !copied.contains("Documented all four"),
++                "the reply that follows is not part of the message: {copied:?}"
++            );
++        });
++    }
++
++    #[gpui::test]
++    fn copying_an_agent_response_is_unchanged(cx: &mut gpui::TestAppContext) {
++        // The converse (wrongly SPLITTING is not the risk here; wrongly WIDENING is):
++        // making the user branch answer must not make the agent branch answer with more
++        // than the response. Green before the patch and it must stay green.
++        cx.update(|cx| {
++            let entries = conversation_entries(cx);
++
++            let first = ThreadView::get_agent_message_content(&entries, 1, cx)
++                .expect("an agent response has always been copyable");
++            assert!(first.contains("Result<Args"), "{first:?}");
++            assert!(
++                !first.contains("Refactor `parse_args`"),
++                "the user's message is not part of the agent's response: {first:?}"
++            );
++            assert!(
++                !first.contains("Documented all four"),
++                "the next turn's response is a different response: {first:?}"
++            );
++
++            let second = ThreadView::get_agent_message_content(&entries, 3, cx)
++                .expect("the second agent response is copyable");
++            assert!(second.contains("Documented all four"), "{second:?}");
++            assert!(!second.contains("Result<Args"), "{second:?}");
++        });
++    }
++
++    #[gpui::test]
++    fn an_empty_user_message_is_not_copyable(cx: &mut gpui::TestAppContext) {
++        // `None` means "nothing to put on the clipboard" everywhere else in this
++        // function; an empty user message must not become `Some("")` and offer a menu
++        // entry that copies nothing.
++        cx.update(|cx| {
++            let entries = vec![acp_thread::AgentThreadEntry::UserMessage(
++                acp_thread::UserMessage {
++                    protocol_id: None,
++                    client_id: None,
++                    is_optimistic: false,
++                    content: acp_thread::ContentBlock::Empty,
++                    chunks: Vec::new(),
++                    checkpoint: None,
++                    indented: false,
++                },
++            )];
++
++            assert_eq!(
++                ThreadView::get_agent_message_content(&entries, 0, cx),
++                None,
++                "an empty message has nothing to copy"
++            );
++        });
++    }
+ 
+     #[test]
+     fn test_leading_native_command_matches_bare_and_with_remainder() {
