@@ -1,0 +1,238 @@
+From 9a0d93a6a8258a1c94cafdf3f00486f25a7db3b3 Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@proton.me>
+Date: Tue, 15 Sep 2026 00:15:58 -0300
+Subject: [PATCH] agent: float the two thread-navigation controls over the
+ conversation
+
+The controls at the end of a turn -- copy this response, scroll to the user
+message, scroll to the top -- are rendered by `render_thread_controls` as a row
+*inside* a list item. That puts them in the scroll flow, so they leave the
+viewport together with the turn they belong to. The two navigation buttons are
+therefore out of reach in exactly the situation that makes them worth having: a
+long thread, scrolled away from both of its ends.
+
+This moves those two onto the conversation container as an absolutely
+positioned overlay, and leaves the copy button where it was.
+
+The split is deliberate, not a compromise. "Scroll to User Message" and "Scroll
+to Top" name a destination in the thread and mean the same thing from anywhere
+in it -- `scroll_to_user_message_index(None, ..)` already resolves to the most
+recent user message, so the floating button needs no index and carries none.
+"Copy This Agent Response" names one response, and a control floating over the
+whole conversation has no way to say which response it means; mid-generation it
+would point at an incomplete one.
+
+Four consequences worth naming, because none is visible in the diff alone:
+
+- The navigation buttons no longer vanish while the agent is generating or
+  while a permission request is pending. `render_thread_controls` early-returns
+  `Empty` in both cases. That was right for a row carrying a copy button and a
+  turn's stats, and wrong for a control whose only job is to move the viewport.
+
+- `scroll_to_top` used to be built only for the bottom-most entry
+  (`is_thread_bottom`). Floating it makes it belong to the thread rather than to
+  an entry, which is what its label always claimed.
+
+- With both buttons gone, every remaining part of the inline row is optional and
+  they can all be absent at once: a last entry that is not an assistant message,
+  turn stats off, feedback unavailable. The navigation buttons used to justify
+  the row's padding unconditionally. It now returns `Empty` instead of leaving
+  an invisible band exactly where they used to be.
+
+- `user_message_index` leaves the signature with its last caller, and so does
+  the per-entry `rposition` search that computed it.
+
+The "Scroll to User Message" button is hidden outright when the thread has no
+user message, rather than left to `scroll_to_user_message_index`'s second
+fallback of scrolling to the end -- a button labelled for one destination that
+silently goes to the opposite one is worse than an absent button.
+
+The overlay clears the vertical scrollbar the same container draws (`right_4`)
+and keeps the inline row's 0.4/1.0 opacity-on-hover, so it reads as the same
+affordance relocated rather than a new one.
+
+Pure Zed: nothing here needs the adapter, so like 0010, 0012 and 0014 it rides
+the claude-agent-acp-plus flag BY CHOICE rather than by dependency.
+---
+
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index 01cefd9..0bcd946 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -6740,13 +6740,6 @@ impl ThreadView {
+             .unwrap_or(!is_generating);
+ 
+         let primary = if is_turn_end && !assistant_message_is_blank {
+-            let user_message_index = thread
+-                .read(cx)
+-                .entries()
+-                .iter()
+-                .take(entry_ix)
+-                .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)));
+-
+             v_flex()
+                 .w_full()
+                 .child(primary)
+@@ -6755,7 +6748,6 @@ impl ThreadView {
+                     entry_ix,
+                     Some(entry_ix),
+                     entry_ix + 1 == total_entries,
+-                    user_message_index,
+                     cx,
+                 ))
+                 .into_any_element()
+@@ -6783,7 +6775,6 @@ impl ThreadView {
+                         entry_ix,
+                         last_assistant_index,
+                         true,
+-                        None,
+                         cx,
+                     ))
+                 })
+@@ -6998,7 +6989,6 @@ impl ThreadView {
+         entry_ix: usize,
+         copy_response_index: Option<usize>,
+         is_thread_bottom: bool,
+-        user_message_index: Option<usize>,
+         cx: &Context<Self>,
+     ) -> impl IntoElement {
+         let is_generating = matches!(thread.read(cx).status(), ThreadStatus::Generating);
+@@ -7023,27 +7013,6 @@ impl ThreadView {
+                 }))
+         });
+ 
+-        let scroll_to_recent_user_prompt = IconButton::new(
+-            ("scroll_to_recent_user_prompt", entry_ix),
+-            IconName::UserArrowUp,
+-        )
+-        .icon_size(IconSize::Small)
+-        .icon_color(Color::Muted)
+-        .tooltip(Tooltip::text("Scroll to User Message"))
+-        .on_click(cx.listener(move |this, _, _, cx| {
+-            this.scroll_to_user_message_index(user_message_index, cx);
+-        }));
+-
+-        let scroll_to_top = is_thread_bottom.then(|| {
+-            IconButton::new(("scroll_to_top", entry_ix), IconName::ArrowUp)
+-                .icon_size(IconSize::Small)
+-                .icon_color(Color::Muted)
+-                .tooltip(Tooltip::text("Scroll to Top"))
+-                .on_click(cx.listener(move |this, _, _, cx| {
+-                    this.scroll_to_top(cx);
+-                }))
+-        });
+-
+         let show_stats = is_thread_bottom && AgentSettings::get_global(cx).show_turn_stats;
+ 
+         let last_turn_clock = show_stats
+@@ -7131,6 +7100,19 @@ impl ThreadView {
+             })
+             .flatten();
+ 
++        // With the navigation buttons gone, every remaining part is optional
++        // and they can all be absent at once: a last entry that is not an
++        // assistant message, turn stats off, feedback unavailable. Rendering
++        // the row regardless leaves an invisible band of padding exactly where
++        // the buttons used to be.
++        if copy_response_button.is_none()
++            && feedback_buttons.is_none()
++            && last_turn_clock.is_none()
++            && last_turn_tokens_label.is_none()
++        {
++            return Empty.into_any_element();
++        }
++
+         let separator_dots = || {
+             Label::new("•")
+                 .size(LabelSize::Small)
+@@ -7163,11 +7145,75 @@ impl ThreadView {
+             )
+             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
+             .when_some(copy_response_button, |this, button| this.child(button))
+-            .child(scroll_to_recent_user_prompt)
+-            .when_some(scroll_to_top, |this, button| this.child(button))
+             .into_any_element()
+     }
+ 
++    /// The two navigation controls, as a fixed overlay on the conversation
++    /// instead of a row inside the last entry.
++    ///
++    /// `render_thread_controls` renders *inside* a list item, so the moment the
++    /// turn it belongs to scrolls out of view its controls go with it --
++    /// precisely when "take me back to my message" and "take me to the top"
++    /// start being useful. Anchoring them on the conversation container instead
++    /// keeps them reachable from anywhere in the thread.
++    ///
++    /// The copy button deliberately stays inline. It copies one specific agent
++    /// response, and a control that floats over the whole conversation has no
++    /// way to say which response it means.
++    fn render_floating_thread_navigation(&self, cx: &Context<Self>) -> impl IntoElement {
++        // `scroll_to_user_message_index(None, ..)` already falls back to the
++        // most recent user message, which is the right target for a control
++        // that is not attached to any particular turn. The button is hidden
++        // outright when there is no user message at all, rather than left to
++        // that function's second fallback of scrolling to the end.
++        let has_user_message = self
++            .thread
++            .read(cx)
++            .entries()
++            .iter()
++            .any(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)));
++
++        div()
++            .absolute()
++            // Clear of the vertical scrollbar the same container draws.
++            .right_4()
++            .bottom_2()
++            .child(
++                h_flex()
++                    .gap_0p5()
++                    .p_0p5()
++                    .rounded_md()
++                    .border_1()
++                    .border_color(cx.theme().colors().border)
++                    .bg(cx.theme().colors().elevated_surface_background)
++                    .opacity(0.4)
++                    .hover(|s| s.opacity(1.))
++                    .when(has_user_message, |this| {
++                        this.child(
++                            IconButton::new(
++                                "floating_scroll_to_user_message",
++                                IconName::UserArrowUp,
++                            )
++                            .icon_size(IconSize::Small)
++                            .icon_color(Color::Muted)
++                            .tooltip(Tooltip::text("Scroll to User Message"))
++                            .on_click(cx.listener(|this, _, _, cx| {
++                                this.scroll_to_user_message_index(None, cx);
++                            })),
++                        )
++                    })
++                    .child(
++                        IconButton::new("floating_scroll_to_top", IconName::ArrowUp)
++                            .icon_size(IconSize::Small)
++                            .icon_color(Color::Muted)
++                            .tooltip(Tooltip::text("Scroll to Top"))
++                            .on_click(cx.listener(|this, _, _, cx| {
++                                this.scroll_to_top(cx);
++                            })),
++                    ),
++            )
++    }
++
+     fn is_thread_feedback_enabled(&self, cx: &App) -> bool {
+         util::maybe!({
+             let project = self.thread.read(cx).project().read(cx);
+@@ -12429,9 +12475,11 @@ impl Render for ThreadView {
+             })
+             .map(|this| {
+                 if has_messages {
+-                    this.flex_1()
++                    this.relative()
++                        .flex_1()
+                         .size_full()
+                         .child(self.render_entries(cx))
++                        .child(self.render_floating_thread_navigation(cx))
+                         .vertical_scrollbar_for(&list_state, window, cx)
+                         .into_any()
+                 } else {
