@@ -1,0 +1,306 @@
+From 5e8fd4ce16c7349f529ad881d5140b0c08c61de8 Mon Sep 17 00:00:00 2001
+From: zed-patches <zed-patches@localhost>
+Date: Sun, 13 Sep 2026 20:22:28 -0300
+Subject: [PATCH] zed: say Zeo in the strings a user actually reads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Twenty-one literals across twelve crates, chosen from an inventory of all 404
+string literals in the tree containing "Zed". The inventory is in the zeo
+repository; what follows is why this patch is twenty-one lines and not four
+hundred.
+
+MOST "Zed" STRINGS MUST KEEP SAYING ZED, and the reasons are not stylistic:
+
+  Vendor, plan, team and service. "Upgrade to Zed Pro", "Your Zed Pro Trial has
+  expired", "sends the current conversation to the Zed team", "Zed's hosted
+  models", "Authorize Zed in your browser". Zeo runs on Zed Industries' backend
+  by design (REBRAND.md section 3). There is no Zeo Pro; a user on that screen is
+  buying a Zed subscription, the OAuth page will say Zed, and the conversation
+  really does go to Zed's team. Renaming these would not be a rebrand, it would
+  be false.
+
+  Font family names. "Zed Mono", "Zed Sans", "Zed Plex Sans", "Zed Icons" are
+  values of font_family: - lookup keys for fonts shipped under those aliases (the
+  file behind "Zed Mono" is Lilex). Rewriting them makes the editor fail to find
+  its own font.
+
+  A User-Agent ("Zed/{} ({}; {})"), theme names ("Zed (Default)") referenced from
+  user settings, literals inside migrator.rs which rewrites user settings, and
+  Windows paths. Each breaks something specific and none of it is visible as a
+  brand.
+
+AND ONE LARGE CLASS NEEDED NO PATCH AT ALL. The window title - the string a user
+sees more than any other - is built from
+
+    ReleaseChannel::try_global(cx).unwrap_or(Stable).display_name()
+
+which patch 0021 already made return "Zeo". Seventy-five sites reach the product
+name that way. The three "Zed — root1, root2" literals that looked like the
+highest-value target in the inventory turned out to be TEST ASSERTIONS for that
+code. Writing a patch for them would have been pure damage.
+
+What is left, and what this changes:
+
+  seen constantly - "Welcome to Zeo" / "Welcome back to Zeo", "Open Zeo Log",
+  "Zeo — Settings", "Zeo failed to launch"
+
+  seen on events - the update flow ("Checking for Zeo Updates…", "A new version
+  of Zeo is available for download.", "Restart to update Zeo"), CLI installation,
+  the xdg-desktop-portal error, the OAuth callback page, and "Add to existing Zeo
+  window"
+
+Deliberately left out: 24 settings descriptions and 154 log, error and macOS-only
+strings. They are churny upstream copy, and buying them costs a refresh conflict
+forever for something read once or never.
+
+These are literals rather than display_name() calls, which is the opposite of
+what the inventory first recommended. Tested before deciding: the sites bind to
+&'static str - `let label = match ... => "Please restart Zed to Collaborate"` -
+so reaching for display_name() forces format!, which turns the binding into a
+String and drags in sibling arms like "Updating..." that have nothing to do with
+the rebrand. Converting those sites properly is a separate change, and one worth
+offering upstream rather than carrying: Zed Nightly displays "Zed" in these same
+strings today, where it should display its own channel name.
+---
+ crates/auto_update/src/auto_update.rs                     | 2 +-
+ crates/cli/src/main.rs                                    | 2 +-
+ crates/install_cli/src/install_cli_binary.rs              | 4 ++--
+ crates/oauth_callback_server/src/oauth_callback_server.rs | 4 ++--
+ crates/onboarding/src/onboarding.rs                       | 2 +-
+ crates/recent_projects/src/remote_servers.rs              | 2 +-
+ crates/settings_ui/src/settings_ui.rs                     | 2 +-
+ crates/title_bar/src/title_bar.rs                         | 6 +++---
+ crates/ui/src/components/collab/update_button.rs          | 6 +++---
+ crates/workspace/src/notifications.rs                     | 4 ++--
+ crates/workspace/src/welcome.rs                           | 4 ++--
+ crates/zed/src/main.rs                                    | 4 ++--
+ 12 files changed, 21 insertions(+), 21 deletions(-)
+
+diff --git a/crates/auto_update/src/auto_update.rs b/crates/auto_update/src/auto_update.rs
+index 4549560..60d2f46 100644
+--- a/crates/auto_update/src/auto_update.rs
++++ b/crates/auto_update/src/auto_update.rs
+@@ -309,7 +309,7 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
+     {
+         drop(window.prompt(
+             gpui::PromptLevel::Info,
+-            "Zed was installed via a package manager.",
++            "Zeo was installed via a package manager.",
+             Some(&message),
+             &["OK"],
+             cx,
+diff --git a/crates/cli/src/main.rs b/crates/cli/src/main.rs
+index 55e1b06..a5d314f 100644
+--- a/crates/cli/src/main.rs
++++ b/crates/cli/src/main.rs
+@@ -858,7 +858,7 @@ fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
+     let blue = console::Style::new().blue();
+     let items = [
+         format!(
+-            "Add to existing Zed window ({})",
++            "Add to existing Zeo window ({})",
+             blue.apply_to("zed --existing")
+         ),
+         format!("Open a new window ({})", blue.apply_to("zed --classic")),
+diff --git a/crates/install_cli/src/install_cli_binary.rs b/crates/install_cli/src/install_cli_binary.rs
+index a88816a..c17c2dc 100644
+--- a/crates/install_cli/src/install_cli_binary.rs
++++ b/crates/install_cli/src/install_cli_binary.rs
+@@ -111,7 +111,7 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
+                                     "You can add `zed` to your PATH manually.",
+                                     cx,
+                                 )
+-                                .with_title("Couldn't install the Zed CLI")
++                                .with_title("Couldn't install the Zeo CLI")
+                                 .more_info_message("Show me how")
+                                 .more_info_url(CANT_INSTALL_DOCS_URL)
+                             })
+@@ -140,5 +140,5 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
+         register_zed_scheme(cx).await.log_err();
+         Ok(())
+     })
+-    .detach_and_prompt_err("Cannot install the Zed CLI", window, cx, |_, _, _| None);
++    .detach_and_prompt_err("Cannot install the Zeo CLI", window, cx, |_, _, _| None);
+ }
+diff --git a/crates/oauth_callback_server/src/oauth_callback_server.rs b/crates/oauth_callback_server/src/oauth_callback_server.rs
+index 44ea229..7ba6608 100644
+--- a/crates/oauth_callback_server/src/oauth_callback_server.rs
++++ b/crates/oauth_callback_server/src/oauth_callback_server.rs
+@@ -308,7 +308,7 @@ mod server {
+                         200,
+                         oauth_callback_page(
+                             "Authorization Successful",
+-                            "You can close this tab and return to Zed.",
++                            "You can close this tab and return to Zeo.",
+                             false,
+                         ),
+                     ),
+@@ -318,7 +318,7 @@ mod server {
+                             400,
+                             oauth_callback_page(
+                                 "Authorization Failed",
+-                                "Something went wrong. Please try again from Zed.",
++                                "Something went wrong. Please try again from Zeo.",
+                                 true,
+                             ),
+                         )
+diff --git a/crates/onboarding/src/onboarding.rs b/crates/onboarding/src/onboarding.rs
+index 220c2b0..294f71e 100644
+--- a/crates/onboarding/src/onboarding.rs
++++ b/crates/onboarding/src/onboarding.rs
+@@ -351,7 +351,7 @@ impl Render for Onboarding {
+                                             .child(
+                                                 v_flex()
+                                                     .child(
+-                                                        Headline::new("Welcome to Zed")
++                                                        Headline::new("Welcome to Zeo")
+                                                             .size(HeadlineSize::Small),
+                                                     )
+                                                     .child(
+diff --git a/crates/recent_projects/src/remote_servers.rs b/crates/recent_projects/src/remote_servers.rs
+index 9861d72..f151fd8 100644
+--- a/crates/recent_projects/src/remote_servers.rs
++++ b/crates/recent_projects/src/remote_servers.rs
+@@ -2369,7 +2369,7 @@ impl RemoteServerProjects {
+                                                 .color(Color::Muted)
+                                                 .size(IconSize::Small),
+                                         )
+-                                        .child(Label::new("Open Zed Log"))
++                                        .child(Label::new("Open Zeo Log"))
+                                         .on_click(cx.listener(|_, _, window, cx| {
+                                             window.dispatch_action(Box::new(OpenLog), cx);
+                                             cx.emit(DismissEvent);
+diff --git a/crates/settings_ui/src/settings_ui.rs b/crates/settings_ui/src/settings_ui.rs
+index 12ede65..76e662e 100644
+--- a/crates/settings_ui/src/settings_ui.rs
++++ b/crates/settings_ui/src/settings_ui.rs
+@@ -891,7 +891,7 @@ fn open_settings_editor_with(
+         cx.open_window(
+             WindowOptions {
+                 titlebar: Some(TitlebarOptions {
+-                    title: Some("Zed — Settings".into()),
++                    title: Some("Zeo — Settings".into()),
+                     appears_transparent: true,
+                     traffic_light_position: Some(point(px(12.0), px(12.0))),
+                 }),
+diff --git a/crates/title_bar/src/title_bar.rs b/crates/title_bar/src/title_bar.rs
+index 09c36b3..41859d0 100644
+--- a/crates/title_bar/src/title_bar.rs
++++ b/crates/title_bar/src/title_bar.rs
+@@ -1167,13 +1167,13 @@ impl TitleBar {
+             client::Status::UpgradeRequired => {
+                 let auto_updater = auto_update::AutoUpdater::get(cx);
+                 let label = match auto_updater.map(|auto_update| auto_update.read(cx).status()) {
+-                    Some(AutoUpdateStatus::Updated { .. }) => "Please restart Zed to Collaborate",
++                    Some(AutoUpdateStatus::Updated { .. }) => "Please restart Zeo to Collaborate",
+                     Some(AutoUpdateStatus::Installing { .. })
+                     | Some(AutoUpdateStatus::Downloading { .. })
+                     | Some(AutoUpdateStatus::Checking) => "Updating...",
+                     Some(AutoUpdateStatus::Idle)
+                     | Some(AutoUpdateStatus::Errored { .. })
+-                    | None => "Please update Zed to Collaborate",
++                    | None => "Please update Zeo to Collaborate",
+                 };
+ 
+                 Some(
+@@ -1317,7 +1317,7 @@ impl TitleBar {
+                                     .w_full()
+                                     .gap_1()
+                                     .justify_between()
+-                                    .child(Label::new("Restart to update Zed").color(Color::Accent))
++                                    .child(Label::new("Restart to update Zeo").color(Color::Accent))
+                                     .child(
+                                         Icon::new(IconName::Download)
+                                             .size(IconSize::Small)
+diff --git a/crates/ui/src/components/collab/update_button.rs b/crates/ui/src/components/collab/update_button.rs
+index 0b94072..ba54ee7 100644
+--- a/crates/ui/src/components/collab/update_button.rs
++++ b/crates/ui/src/components/collab/update_button.rs
+@@ -100,19 +100,19 @@ impl UpdateButton {
+     }
+ 
+     pub fn checking() -> Self {
+-        Self::new(IconName::LoadCircle, "Checking for Zed Updates…")
++        Self::new(IconName::LoadCircle, "Checking for Zeo Updates…")
+             .icon_animate(true)
+             .disabled(true)
+     }
+ 
+     pub fn downloading(progress: Option<f32>) -> Self {
+-        Self::new(IconName::Download, "Downloading Zed Update…")
++        Self::new(IconName::Download, "Downloading Zeo Update…")
+             .progress(progress)
+             .disabled(true)
+     }
+ 
+     pub fn installing(version: impl Into<SharedString>) -> Self {
+-        Self::new(IconName::LoadCircle, "Installing Zed Update…")
++        Self::new(IconName::LoadCircle, "Installing Zeo Update…")
+             .icon_animate(true)
+             .tooltip(version)
+             .disabled(true)
+diff --git a/crates/workspace/src/notifications.rs b/crates/workspace/src/notifications.rs
+index 697f4f3..1531d38 100644
+--- a/crates/workspace/src/notifications.rs
++++ b/crates/workspace/src/notifications.rs
+@@ -1210,7 +1210,7 @@ pub mod simple_message_notification {
+             });
+ 
+             let with_primary_action = cx.new(|cx| {
+-                MessageNotification::new("A new version of Zed is available for download.", cx)
++                MessageNotification::new("A new version of Zeo is available for download.", cx)
+                     .with_title("Update Available")
+                     .primary_message("Restart Now")
+                     .primary_icon(IconName::ArrowCircle)
+@@ -1313,7 +1313,7 @@ pub mod simple_message_notification {
+                     "Linux desktop portal initialization failed.".into()
+                 }
+                 fn secondary_message(&self) -> Option<SharedString> {
+-                    Some("Zed needs an xdg-desktop-portal implementation to open files.".into())
++                    Some("Zeo needs an xdg-desktop-portal implementation to open files.".into())
+                 }
+                 fn severity(&self) -> ErrorSeverity {
+                     ErrorSeverity::Critical
+diff --git a/crates/workspace/src/welcome.rs b/crates/workspace/src/welcome.rs
+index 837418e..990abed 100644
+--- a/crates/workspace/src/welcome.rs
++++ b/crates/workspace/src/welcome.rs
+@@ -448,9 +448,9 @@ impl Render for WelcomePage {
+         };
+ 
+         let welcome_label = if self.fallback_to_recent_projects {
+-            "Welcome back to Zed"
++            "Welcome back to Zeo"
+         } else {
+-            "Welcome to Zed"
++            "Welcome to Zeo"
+         };
+ 
+         h_flex()
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index e081e1c..81bec29 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -94,7 +94,7 @@ fn build_application() -> Application {
+ }
+ 
+ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
+-    let message = "Zed failed to launch";
++    let message = "Zeo failed to launch";
+     let error_details = errors
+         .into_iter()
+         .flat_map(|(kind, paths)| {
+@@ -176,7 +176,7 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
+             proxy
+                 .add_notification(
+                     notification_id,
+-                    Notification::new("Zed failed to launch")
++                    Notification::new("Zeo failed to launch")
+                         .body(Some(
+                             format!(
+                                 "{e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
+-- 
+2.55.0
+

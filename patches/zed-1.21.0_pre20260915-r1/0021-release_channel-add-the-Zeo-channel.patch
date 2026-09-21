@@ -1,0 +1,310 @@
+From bb087d25cb8e2768fe2227c7d28971ae35574096 Mon Sep 17 00:00:00 2001
+From: zed-patches <zed-patches@localhost>
+Date: Sat, 12 Sep 2026 22:50:49 -0300
+Subject: [PATCH 22/22] release_channel: add the Zeo channel
+
+Zeo gets its own ReleaseChannel variant rather than reusing Nightly or Stable,
+so that every channel-keyed decision in the tree is resolved for it explicitly.
+The enum is matched exhaustively across the workspace, which means adding a fifth
+variant makes the compiler enumerate every site that has to choose - with file
+and line - instead of letting Zeo inherit whatever the nearest channel happens to
+do. Eighteen decisions came out of that, and two of them were not obvious.
+
+Inside the crate: display_name "Zeo", dev_name "zeo", app_id "dev.zeo.Zeo",
+Windows app_identifier "Zeo-Editor", no release_query_param, Stable-like
+docs_url, "zeo" parsed by from_str, ALL widened to five, and poll_for_updates
+false - Zeo is installed by a package manager and must never replace itself with
+an official Zed binary.
+
+Across the workspace, each site and the reasoning for its arm:
+
+  extension_host/wasm_host/wit.rs - THE ONE THAT MATTERED. Two matches decide
+  which Wasm extension API versions the host accepts, and whether UNRELEASED
+  versions are authorised. Dev and Nightly get latest::MAX_VERSION and are
+  allowed unreleased API; Stable and Preview are held to since_v0_6_0. Zeo goes
+  with Stable. Grouping it with Nightly would have let extensions written for Zeo
+  depend on API that exists in no Zed release - fragmenting the extension
+  ecosystem Zeo exists to stay inside. It is the "never touch the WIT" rule one
+  level up: not renaming zed:extension is not enough if the version range drifts.
+
+  zed_credentials_provider - the Dev arm uses a development credentials store to
+  avoid keychain prompts during debugging. Zeo is an installed build, so it joins
+  Nightly/Preview/Stable on the real system keychain.
+
+  remote_server (x2) - version reporting. Stable and Preview print
+  ZED_PKG_VERSION; Nightly and Dev print a commit sha. Zeo is packaged and
+  versioned by an ebuild, so it prints the version.
+
+  client/zed_urls.rs and the crate's own docs_url - Zeo uses Zed Industries'
+  servers and documentation; there is no Zeo backend. Both group with Stable.
+
+  auto_update - release_notes_url points at github.com/lucascouts/zeo/releases.
+
+  auto_update_ui - an announcement gate whose arms are currently identical;
+  recorded here so the next person does not have to re-derive that it is a no-op.
+
+  zed/src/zed.rs - the About window icon, via include_bytes! on
+  resources/app-icon-zeo.png. THAT FILE IS NOT ADDED BY ANY PATCH, and cannot be:
+  GNU patch refuses a git binary hunk outright - "git binary diffs are not
+  supported" - and both refresh.sh and Portage's eapply run `patch -p1`. The
+  ebuild copies the art in from FILESDIR during src_prepare, before eapply. A
+  build without that step fails here, at compile time, with a missing file.
+
+Also crates/zed/build.rs, which is NOT one of the enumerated sites and is the
+reason this needs saying: it picks the embedded window icon by matching the
+RELEASE_CHANNEL *environment variable* as a string, with a `_ => "-dev"` arm. A
+missing "zeo" case there compiles clean, warns about nothing, and ships a Zeo
+that draws Zed's development icon. The compiler cannot help; only looking at the
+window can. Note also that the env var and crates/zed/RELEASE_CHANNEL are two
+different inputs - the file drives this enum, the variable drives build.rs, and
+the ebuild has to set both.
+
+Decisions D2 and D3 in zeo/docs/REBRAND.md.
+---
+ crates/auto_update/src/auto_update.rs         |  1 +
+ crates/auto_update_ui/src/auto_update_ui.rs   |  7 ++++---
+ crates/client/src/zed_urls.rs                 |  2 +-
+ crates/extension_host/src/wasm_host/wit.rs    |  6 ++++--
+ crates/release_channel/src/lib.rs             | 21 ++++++++++++++++---
+ crates/remote_server/src/server.rs            |  6 ++++--
+ crates/zed/build.rs                           |  1 +
+ crates/zed/src/zed.rs                         |  1 +
+ .../src/zed_credentials_provider.rs           |  8 ++++++-
+ 9 files changed, 41 insertions(+), 12 deletions(-)
+
+diff --git a/crates/auto_update/src/auto_update.rs b/crates/auto_update/src/auto_update.rs
+index 0d86651..4549560 100644
+--- a/crates/auto_update/src/auto_update.rs
++++ b/crates/auto_update/src/auto_update.rs
+@@ -354,6 +354,7 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
+             "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+         }
+         ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
++        ReleaseChannel::Zeo => "https://github.com/lucascouts/zeo/releases".to_string(),
+     };
+     Some(url)
+ }
+diff --git a/crates/auto_update_ui/src/auto_update_ui.rs b/crates/auto_update_ui/src/auto_update_ui.rs
+index b6f4fae..fa4de6b 100644
+--- a/crates/auto_update_ui/src/auto_update_ui.rs
++++ b/crates/auto_update_ui/src/auto_update_ui.rs
+@@ -209,9 +209,10 @@ impl Dismissable for SkillsAnnouncement {
+ fn announcement_for_version(version: &Version, cx: &App) -> Option<AnnouncementContent> {
+     let version_with_skills = match ReleaseChannel::global(cx) {
+         ReleaseChannel::Stable => Version::new(1, 4, 0),
+-        ReleaseChannel::Dev | ReleaseChannel::Nightly | ReleaseChannel::Preview => {
+-            Version::new(1, 4, 0)
+-        }
++        ReleaseChannel::Dev
++        | ReleaseChannel::Nightly
++        | ReleaseChannel::Preview
++        | ReleaseChannel::Zeo => Version::new(1, 4, 0),
+     };
+ 
+     if *version >= version_with_skills && !SkillsAnnouncement::dismissed(cx) {
+diff --git a/crates/client/src/zed_urls.rs b/crates/client/src/zed_urls.rs
+index d9cd625..7f7cdaf 100644
+--- a/crates/client/src/zed_urls.rs
++++ b/crates/client/src/zed_urls.rs
+@@ -17,7 +17,7 @@ fn server_url(cx: &App) -> &str {
+ fn docs_url(cx: &App) -> String {
+     let server_url = server_url(cx);
+     match ReleaseChannel::try_global(cx).unwrap_or_default() {
+-        ReleaseChannel::Stable => {
++        ReleaseChannel::Stable | ReleaseChannel::Zeo => {
+             format!("{server_url}/docs")
+         }
+         ReleaseChannel::Preview => {
+diff --git a/crates/extension_host/src/wasm_host/wit.rs b/crates/extension_host/src/wasm_host/wit.rs
+index 34d75c8..616b476 100644
+--- a/crates/extension_host/src/wasm_host/wit.rs
++++ b/crates/extension_host/src/wasm_host/wit.rs
+@@ -63,7 +63,9 @@ pub fn wasm_api_version_range(release_channel: ReleaseChannel) -> RangeInclusive
+ 
+     let max_version = match release_channel {
+         ReleaseChannel::Dev | ReleaseChannel::Nightly => latest::MAX_VERSION,
+-        ReleaseChannel::Stable | ReleaseChannel::Preview => since_v0_6_0::MAX_VERSION,
++        ReleaseChannel::Stable | ReleaseChannel::Preview | ReleaseChannel::Zeo => {
++            since_v0_6_0::MAX_VERSION
++        }
+     };
+ 
+     since_v0_0_1::MIN_VERSION..=max_version
+@@ -77,7 +79,7 @@ pub fn authorize_access_to_unreleased_wasm_api_version(
+ ) -> Result<()> {
+     let allow_unreleased_version = match release_channel {
+         ReleaseChannel::Dev | ReleaseChannel::Nightly => true,
+-        ReleaseChannel::Stable | ReleaseChannel::Preview => {
++        ReleaseChannel::Stable | ReleaseChannel::Preview | ReleaseChannel::Zeo => {
+             // We always allow the latest in tests so that the extension tests pass on release branches.
+             cfg!(any(test, feature = "test-support"))
+         }
+diff --git a/crates/release_channel/src/lib.rs b/crates/release_channel/src/lib.rs
+index c79ca14..f84a970 100644
+--- a/crates/release_channel/src/lib.rs
++++ b/crates/release_channel/src/lib.rs
+@@ -48,6 +48,7 @@ pub fn app_identifier() -> &'static str {
+         ReleaseChannel::Nightly => "Zed-Editor-Nightly",
+         ReleaseChannel::Preview => "Zed-Editor-Preview",
+         ReleaseChannel::Stable => "Zed-Editor-Stable",
++        ReleaseChannel::Zeo => "Zeo-Editor",
+     }
+ }
+ 
+@@ -151,6 +152,14 @@ pub enum ReleaseChannel {
+ 
+     /// The Stable release channel.
+     Stable,
++
++    /// The Zeo release channel.
++    ///
++    /// Zeo is a rebranded build of Zed. It is its own channel so that every
++    /// channel-keyed decision - name, app id, state directories, whether to
++    /// poll for updates - is resolved for it explicitly, at compile time,
++    /// rather than falling through to a Zed default.
++    Zeo,
+ }
+ 
+ struct GlobalReleaseChannel(ReleaseChannel);
+@@ -179,11 +188,12 @@ pub fn docs_url(slug: &str, cx: &App) -> String {
+ 
+ impl ReleaseChannel {
+     /// All release channels.
+-    pub const ALL: [ReleaseChannel; 4] = [
++    pub const ALL: [ReleaseChannel; 5] = [
+         ReleaseChannel::Dev,
+         ReleaseChannel::Nightly,
+         ReleaseChannel::Preview,
+         ReleaseChannel::Stable,
++        ReleaseChannel::Zeo,
+     ];
+ 
+     /// Returns the global [`ReleaseChannel`].
+@@ -199,7 +209,7 @@ impl ReleaseChannel {
+ 
+     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
+     pub fn poll_for_updates(&self) -> bool {
+-        !matches!(self, ReleaseChannel::Dev)
++        !matches!(self, ReleaseChannel::Dev | ReleaseChannel::Zeo)
+     }
+ 
+     /// Returns the display name for this [`ReleaseChannel`].
+@@ -209,6 +219,7 @@ impl ReleaseChannel {
+             ReleaseChannel::Nightly => "Zed Nightly",
+             ReleaseChannel::Preview => "Zed Preview",
+             ReleaseChannel::Stable => "Zed",
++            ReleaseChannel::Zeo => "Zeo",
+         }
+     }
+ 
+@@ -219,6 +230,7 @@ impl ReleaseChannel {
+             ReleaseChannel::Nightly => "nightly",
+             ReleaseChannel::Preview => "preview",
+             ReleaseChannel::Stable => "stable",
++            ReleaseChannel::Zeo => "zeo",
+         }
+     }
+ 
+@@ -231,6 +243,7 @@ impl ReleaseChannel {
+             ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
+             ReleaseChannel::Preview => "dev.zed.Zed-Preview",
+             ReleaseChannel::Stable => "dev.zed.Zed",
++            ReleaseChannel::Zeo => "dev.zeo.Zeo",
+         }
+     }
+ 
+@@ -241,6 +254,7 @@ impl ReleaseChannel {
+             Self::Nightly => Some("nightly=1"),
+             Self::Preview => Some("preview=1"),
+             Self::Stable => None,
++            Self::Zeo => None,
+         }
+     }
+ 
+@@ -250,7 +264,7 @@ impl ReleaseChannel {
+         let channel_path_segment = match self {
+             Self::Dev | Self::Nightly => Some("nightly"),
+             Self::Preview => Some("preview"),
+-            Self::Stable => None,
++            Self::Stable | Self::Zeo => None,
+         };
+ 
+         match channel_path_segment {
+@@ -275,6 +289,7 @@ impl FromStr for ReleaseChannel {
+             "nightly" => ReleaseChannel::Nightly,
+             "preview" => ReleaseChannel::Preview,
+             "stable" => ReleaseChannel::Stable,
++            "zeo" => ReleaseChannel::Zeo,
+             _ => return Err(InvalidReleaseChannel),
+         })
+     }
+diff --git a/crates/remote_server/src/server.rs b/crates/remote_server/src/server.rs
+index 6a4bf3d..14fa1fc 100644
+--- a/crates/remote_server/src/server.rs
++++ b/crates/remote_server/src/server.rs
+@@ -107,7 +107,7 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
+         Commands::Version => {
+             let release_channel = *RELEASE_CHANNEL;
+             match release_channel {
+-                ReleaseChannel::Stable | ReleaseChannel::Preview => {
++                ReleaseChannel::Stable | ReleaseChannel::Preview | ReleaseChannel::Zeo => {
+                     println!("{}", env!("ZED_PKG_VERSION"))
+                 }
+                 ReleaseChannel::Nightly | ReleaseChannel::Dev => {
+@@ -127,7 +127,9 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
+ }
+ 
+ pub static VERSION: LazyLock<String> = LazyLock::new(|| match *RELEASE_CHANNEL {
+-    ReleaseChannel::Stable | ReleaseChannel::Preview => env!("ZED_PKG_VERSION").to_owned(),
++    ReleaseChannel::Stable | ReleaseChannel::Preview | ReleaseChannel::Zeo => {
++        env!("ZED_PKG_VERSION").to_owned()
++    }
+     ReleaseChannel::Nightly | ReleaseChannel::Dev => {
+         let commit_sha = option_env!("ZED_COMMIT_SHA").unwrap_or("missing-zed-commit-sha");
+         let build_identifier = option_env!("ZED_BUILD_ID");
+diff --git a/crates/zed/build.rs b/crates/zed/build.rs
+index f49396a..7b18526 100644
+--- a/crates/zed/build.rs
++++ b/crates/zed/build.rs
+@@ -227,6 +227,7 @@ fn icon_path() -> std::path::PathBuf {
+         "preview" => "-preview",
+         "nightly" => "-nightly",
+         "dev" => "-dev",
++        "zeo" => "-zeo",
+         _ => "-dev",
+     };
+ 
+diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
+index c4bf14e..2524522 100644
+--- a/crates/zed/src/zed.rs
++++ b/crates/zed/src/zed.rs
+@@ -1533,6 +1533,7 @@ fn open_about_window(cx: &mut App) {
+                 include_bytes!("../resources/app-icon-preview.png").as_slice()
+             }
+             ReleaseChannel::Stable => include_bytes!("../resources/app-icon.png").as_slice(),
++            ReleaseChannel::Zeo => include_bytes!("../resources/app-icon-zeo.png").as_slice(),
+         };
+ 
+         Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec()))
+diff --git a/crates/zed_credentials_provider/src/zed_credentials_provider.rs b/crates/zed_credentials_provider/src/zed_credentials_provider.rs
+index 6705e58..b65bf51 100644
+--- a/crates/zed_credentials_provider/src/zed_credentials_provider.rs
++++ b/crates/zed_credentials_provider/src/zed_credentials_provider.rs
+@@ -53,7 +53,13 @@ fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
+             // variable is set, we will use the actual keychain.
+             !*ZED_DEVELOPMENT_USE_KEYCHAIN
+         }
+-        Some(ReleaseChannel::Nightly | ReleaseChannel::Preview | ReleaseChannel::Stable) | None => {
++        Some(
++            ReleaseChannel::Nightly
++            | ReleaseChannel::Preview
++            | ReleaseChannel::Stable
++            | ReleaseChannel::Zeo,
++        )
++        | None => {
+             false
+         }
+     };
+-- 
+2.55.0
+

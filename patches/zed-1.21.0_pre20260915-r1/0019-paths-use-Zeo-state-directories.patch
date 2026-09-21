@@ -1,0 +1,51 @@
+From c138614d49f824b810dd233b6ec65f56f9511e79 Mon Sep 17 00:00:00 2001
+From: zed-patches <zed-patches@localhost>
+Date: Sat, 12 Sep 2026 22:41:52 -0300
+Subject: [PATCH 19/22] paths: use Zeo state directories
+
+Zeo must not read or write Zed's user data. A rebranded editor sharing
+~/.config/zed with the editor it is derived from is not a second editor: it is
+the same editor under two names, where either one can corrupt the other's
+settings, and where uninstalling one takes the other's history with it.
+
+Upstream made this a one-line change on purpose. The constant carries its own
+instruction:
+
+    /// The application name, used to derive platform-specific data, config,
+    /// cache, and state directory paths.
+    ///
+    /// Forks should change this to avoid colliding with Zed's user data.
+    pub const APP_NAME: &str = "Zed";
+
+Everything else is derived from it. APP_NAME_LOWERCASE is computed from APP_NAME
+in a const block a few lines below, with asserts for emptiness, ASCII, path
+separators and control characters - so the XDG paths (~/.config/zeo,
+~/.local/share/zeo, the cache, state, logs and the database) all follow without a
+second edit, and a malformed name fails at compile time rather than at runtime.
+
+This is deliberately the whole of the change. There is no compatibility shim that
+falls back to reading ~/.config/zed: a fallback would reintroduce exactly the
+coupling the separation exists to remove, and would do it silently. Migrating
+settings from Zed is a copy the user makes, knowingly, once.
+
+Decision D4 in zeo/docs/REBRAND.md.
+---
+ crates/paths/src/paths.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/paths/src/paths.rs b/crates/paths/src/paths.rs
+index 9c16f1d..7a33c67 100644
+--- a/crates/paths/src/paths.rs
++++ b/crates/paths/src/paths.rs
+@@ -15,7 +15,7 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
+ /// and state directory paths.
+ ///
+ /// Forks should change this to avoid colliding with Zed's user data.
+-pub const APP_NAME: &str = "Zed";
++pub const APP_NAME: &str = "Zeo";
+ 
+ /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
+ /// Linux/FreeBSD and the macOS `~/.config` fallback.
+-- 
+2.55.0
+
