@@ -1095,6 +1095,148 @@ test_status_calls_the_advisory_step_in_its_own_body() {
 	rm -rf "${tmp}"
 }
 
+# --- status.sh: the installed column (task 1.2) ------------------------------
+#
+# The adapters table compared two declarations -- the repo's package.json and the
+# overlay's ebuild -- plus what npm had published, and said `ok` when they agreed.
+# None of the three says what Portage has actually MERGED, so the table could
+# report agreement across the board while the adapter this machine runs was a
+# release behind. Measured 2026-09-22: repo and ebuild at 0.19.0 and 0.13.3,
+# /var/db/pkg at 0.18.0 and 0.13.2, every row `ok`.
+#
+# The fixture controls the overlay (ZP_OVERLAY) and the merged set (ZP_VDB), and
+# DERIVES its expected versions from the real package.json files: ROOT is where
+# status.sh lives, so the `repo` column cannot be faked from here. Deriving rather
+# than hardcoding is the same reason the protocol cases cut PATH -- the adapters
+# release on their own cadence, and a literal would turn these cases red at the
+# next release for a reason unrelated to this column.
+#
+# The exit code is deliberately NOT asserted: check-sync.sh finds no series for
+# the fixture version, so status.sh exits 1 in all three cases whatever this
+# column decides. The row's own mark is the assertion, and `DRIFT` there is
+# written by the same branch that calls note_drift -- one printf earlier.
+
+# adapter_repo_version <relative-repo> — the version status.sh will read for the
+# `repo` column of that adapter.
+adapter_repo_version() {
+	python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' \
+		"${REPO_ROOT}/../$1/package.json"
+}
+
+# make_adapter_ebuild <overlay> <pkg> <version> — one dev-util ebuild, the shape
+# ebuild_version() parses.
+make_adapter_ebuild() {
+	mkdir -p "$1/dev-util/$2"
+	printf 'EAPI=8\n' >"$1/dev-util/$2/$2-$3.ebuild"
+}
+
+# make_vdb_entry <vdb> <pkg> <version> — one merged package, the shape the vdb
+# has: a directory named <PN>-<PVR> under the category.
+make_vdb_entry() {
+	mkdir -p "$1/dev-util/$2-$3"
+	printf '%s\n' "dev-util/$2-$3" >"$1/dev-util/$2-$3/PF"
+}
+
+# run_status <overlay> <vdb> <chain> — the real scripts/status.sh, --offline.
+#
+# CLAUDE_CONFIG_DIR points at an empty directory so the protocol contract skips
+# its live clause instead of probing this machine's real lock files: that clause
+# has nothing to do with the adapters table and would add a socket per lock.
+run_status() {
+	local overlay="$1" vdb="$2" chain="$3"
+	mkdir -p "${chain}/empty-ide/ide"
+	PATH="/usr/bin:/bin" \
+		CLAUDE_CONFIG_DIR="${chain}/empty-ide" \
+		ZP_CHAIN_ROOT="${chain}" \
+		ZP_OVERLAY="${overlay}" \
+		ZP_VDB="${vdb}" \
+		ZP_DISTDIR="${chain}/dist" \
+		ZP_WORKROOT="${chain}/work" \
+		bash "${REPO_ROOT}/../scripts/status.sh" --offline 2>&1
+}
+
+# adapter_row <output> <package-name> — the one table line naming that package.
+adapter_row() {
+	printf '%s\n' "$1" | grep -F -- "$2" | head -n1
+}
+
+test_status_installed_agreeing_is_ok() {
+	case_start "status: an installed version agreeing with the ebuild leaves the adapter row ok"
+	local tmp out plus tui v_plus v_tui
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
+	v_plus="$(adapter_repo_version claude-agent-plus/claude-agent-acp-plus)"
+	v_tui="$(adapter_repo_version claude-agent-tui/claude-agent-tui)"
+	make_adapter_ebuild "${tmp}/overlay" claude-agent-acp-plus "${v_plus}"
+	make_adapter_ebuild "${tmp}/overlay" claude-agent-acp-tui "${v_tui}"
+	make_vdb_entry "${tmp}/vdb" claude-agent-acp-plus "${v_plus}"
+	make_vdb_entry "${tmp}/vdb" claude-agent-acp-tui "${v_tui}"
+
+	out="$(run_status "${tmp}/overlay" "${tmp}/vdb" "${tmp}/chain")"
+	plus="$(adapter_row "${out}" '@lucascouts/claude-agent-acp-plus')"
+	tui="$(adapter_row "${out}" '@lucascouts/claude-agent-tui')"
+
+	assert_contains "${out}" 'installed' &&
+		assert_contains "${plus}" "ok" &&
+		assert_contains "${plus}" "${v_plus}" &&
+		assert_not_contains "${plus}" "DRIFT" &&
+		assert_not_contains "${tui}" "DRIFT" && ok
+	rm -rf "${tmp}"
+}
+
+test_status_installed_behind_is_drift() {
+	case_start "status: an installed version behind the ebuild is drift, and the row says which side is behind"
+	local tmp out plus tui v_plus v_tui
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
+	v_plus="$(adapter_repo_version claude-agent-plus/claude-agent-acp-plus)"
+	v_tui="$(adapter_repo_version claude-agent-tui/claude-agent-tui)"
+	make_adapter_ebuild "${tmp}/overlay" claude-agent-acp-plus "${v_plus}"
+	make_adapter_ebuild "${tmp}/overlay" claude-agent-acp-tui "${v_tui}"
+	# 0.0.1 is behind anything either adapter has ever published, so the case
+	# needs no arithmetic on the real version to stay behind it.
+	make_vdb_entry "${tmp}/vdb" claude-agent-acp-plus 0.0.1
+	make_vdb_entry "${tmp}/vdb" claude-agent-acp-tui "${v_tui}"
+
+	out="$(run_status "${tmp}/overlay" "${tmp}/vdb" "${tmp}/chain")"
+	plus="$(adapter_row "${out}" '@lucascouts/claude-agent-acp-plus')"
+	tui="$(adapter_row "${out}" '@lucascouts/claude-agent-tui')"
+
+	assert_contains "${plus}" "DRIFT" &&
+		assert_contains "${plus}" "0.0.1" &&
+		assert_contains "${out}" "behind" &&
+		assert_not_contains "${tui}" "DRIFT" && ok
+	rm -rf "${tmp}"
+}
+
+test_status_installed_absent_is_named() {
+	case_start "status: a package Portage has not merged prints absent, never an empty cell"
+	local tmp out plus v_plus v_tui
+	tmp="$(mktemp -d)"
+	make_chain "${tmp}/chain"
+	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
+	v_plus="$(adapter_repo_version claude-agent-plus/claude-agent-acp-plus)"
+	v_tui="$(adapter_repo_version claude-agent-tui/claude-agent-tui)"
+	make_adapter_ebuild "${tmp}/overlay" claude-agent-acp-plus "${v_plus}"
+	make_adapter_ebuild "${tmp}/overlay" claude-agent-acp-tui "${v_tui}"
+	mkdir -p "${tmp}/vdb/dev-util"
+	make_vdb_entry "${tmp}/vdb" claude-agent-acp-tui "${v_tui}"
+
+	out="$(run_status "${tmp}/overlay" "${tmp}/vdb" "${tmp}/chain")"
+	plus="$(adapter_row "${out}" '@lucascouts/claude-agent-acp-plus')"
+
+	# Absent ABSTAINS rather than drifting: nothing merged is not two copies
+	# disagreeing, and a machine that installs the adapters some other way must
+	# not have the chain's top-line answer turned red by that choice. It is said
+	# in a word for the same reason `skipped` and `?` are -- an empty cell reads
+	# like agreement.
+	assert_contains "${plus}" "absent" &&
+		assert_not_contains "${plus}" "DRIFT" && ok
+	rm -rf "${tmp}"
+}
+
 # --- check-protocol.sh: which lock file the live clause probes ---------------
 #
 # The live clause is the only part of this tooling that opens a socket, so it is
@@ -1300,6 +1442,10 @@ main() {
 	test_protocol_picks_a_lock_that_answers
 	test_protocol_skips_when_no_lock_answers
 	test_protocol_still_reports_drift_on_an_answering_lock
+
+	test_status_installed_agreeing_is_ok
+	test_status_installed_behind_is_drift
+	test_status_installed_absent_is_named
 
 	printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
 	[[ "${FAIL}" -eq 0 ]]
