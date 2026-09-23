@@ -90,10 +90,12 @@
 # Zed, BY CHOICE, and the only one of the five that is new UI rather than an
 # affordance over existing machinery.
 0016-composer-markdown-preview.patch
-# 0017: native rendering for a compaction the adapter reports. The ACP
-# compaction_update variant is unreachable here -- agent-client-protocol 2.0.0
-# and -schema 1.5.0 contain zero occurrences of "compaction" -- so this reads
-# the adapter's versioned _meta.contextCompaction and dispatches into the
+# 0017: native rendering for a compaction the adapter reports. NOT because the
+# ACP notification is unreachable -- that was this comment's claim until
+# 2026-09-22 and it was false; acp_thread.rs matches
+# acp::SessionUpdate::CompactionUpdate and the linked crate is 2.2.0 / schema
+# 1.9.1. It is because _meta.contextCompaction is the channel the adapter
+# actually sends, so this reads that versioned key and dispatches into the
 # EXISTING push_context_compaction. An unknown version falls through to the
 # generic tool row untouched. Both the opening and terminal frames are consumed
 # at the same seam, or update_tool_call fabricates a "Tool call not found"
