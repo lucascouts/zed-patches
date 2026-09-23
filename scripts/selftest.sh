@@ -1307,8 +1307,12 @@ make_lock() {
 
 # run_protocol <config-dir> — check-protocol.sh against a fixture lock directory.
 run_protocol() {
-	PATH=/usr/bin:/bin CLAUDE_CONFIG_DIR="$1" \
-		bash "${SCRIPTS}/check-protocol.sh" 2>&1
+	# Run with the fixture directory as cwd: the hostile-name case needs a marker
+	# it can name WITHOUT a slash, since a slash in a filename cannot be created
+	# at all -- the first version of that case silently created nothing and passed
+	# vacuously.
+	( cd "$1" && PATH=/usr/bin:/bin CLAUDE_CONFIG_DIR="$1" \
+		bash "${SCRIPTS}/check-protocol.sh" 2>&1 )
 }
 
 test_protocol_picks_a_lock_that_answers() {
@@ -1331,6 +1335,39 @@ test_protocol_picks_a_lock_that_answers() {
 	assert_contains "${out}" "port ${live}:" &&
 		assert_not_contains "${out}" "port ${dead_a}:" &&
 		assert_not_contains "${out}" "port ${dead_b}:" && ok
+	rm -rf "${tmp}"
+}
+
+test_protocol_refuses_a_lock_name_that_is_not_a_port() {
+	case_start "protocol: a lock file whose name would execute a command is refused, not dialled"
+	local tmp ide out status marker
+	tmp="$(mktemp -d)"
+	ide="${tmp}/ide"
+	marker="${tmp}/executed"
+	mkdir -p "${ide}"
+	# The port is derived from the filename, and ~/.claude/ide holds whatever any
+	# IDE integration wrote there. Spliced into a shell string, this name runs
+	# `touch`; the marker is how the case tells dialling from executing, because
+	# both leave the same silence behind. The payload names the marker RELATIVELY
+	# and run_protocol supplies the cwd -- an absolute path would put slashes in
+	# the filename, which cannot be created, and the case would pass vacuously.
+	: >"${ide}/\$(touch executed).lock"
+	[[ -e "${ide}/\$(touch executed).lock" ]] || {
+		no "the fixture lock was never created -- the case would prove nothing"
+		rm -rf "${tmp}"
+		return 1
+	}
+	make_lock "${ide}" "$(dead_port 10001)"
+
+	out="$(run_protocol "${tmp}")"
+	status=$?
+
+	{ [[ ! -e "${marker}" ]] || {
+		no "the lock file's name was EXECUTED -- ${marker} exists"
+		false
+	}; } &&
+		assert_status 0 "${status}" &&
+		assert_not_contains "${out}" "DRIFT" && ok
 	rm -rf "${tmp}"
 }
 
@@ -1441,6 +1478,7 @@ main() {
 
 	test_protocol_picks_a_lock_that_answers
 	test_protocol_skips_when_no_lock_answers
+	test_protocol_refuses_a_lock_name_that_is_not_a_port
 	test_protocol_still_reports_drift_on_an_answering_lock
 
 	test_status_installed_agreeing_is_ok

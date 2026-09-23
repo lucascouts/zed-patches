@@ -148,7 +148,17 @@ check_cli() {
 lock_answers() {
 	local port="${1##*/}"
 	port="${port%.lock}"
-	timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}" 2>/dev/null
+	# The port comes out of a FILENAME, and the filename is data: ~/.claude/ide
+	# holds whatever any IDE integration wrote there. Interpolated into a shell
+	# string, a lock called `$(command).lock` would be executed rather than
+	# dialled. No privilege boundary is crossed -- the directory is the user's own
+	# -- which is exactly the argument that makes people skip the check; it is one
+	# line, so there is nothing to weigh.
+	[[ "${port}" =~ ^[0-9]+$ ]] || return 1
+	((port > 0 && port < 65536)) || return 1
+	# Passed as an argument rather than spliced into the string, so the guard above
+	# is the second line of defence and not the only one.
+	timeout 2 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "${port}" 2>/dev/null
 }
 
 # probe_handshake <port> <token> -- the 101 must name the subprotocol back, and a
