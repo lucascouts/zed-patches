@@ -135,6 +135,22 @@ check_cli() {
 
 # --- live: what a running Zed actually puts on the wire -------------------------
 
+# lock_answers <lock> -- whether the port the lock file is named after accepts a
+# TCP connect. `~/.claude/ide` is written by every IDE integration and cleaned by
+# none of them, so most of what is in it is the record of a process that exited:
+# measured 2026-09-22, 23 lock files, 10 answering and 13 stale.
+#
+# bash's own /dev/tcp rather than nc, so the cheap question stays cheap and adds
+# no dependency the caller has not already checked for. A refused connect and a
+# bash without net redirections both come back non-zero -- indistinguishable
+# here, and harmlessly so: either way this lock cannot be probed, and the caller
+# moves to the next one.
+lock_answers() {
+	local port="${1##*/}"
+	port="${port%.lock}"
+	timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}" 2>/dev/null
+}
+
 # probe_handshake <port> <token> -- the 101 must name the subprotocol back, and a
 # request without the token must not get one at all.
 probe_handshake() {
@@ -188,14 +204,38 @@ check_live() {
 
 	# One window is enough: every window of one Zed writes the same shape. Probing
 	# all of them would say the same thing N times and open N sockets to do it.
-	local lock port token ide
-	lock="${locks[0]}"
-	port="$(basename "${lock}" .lock)"
-	ide="$(jq -r '.ideName // ""' "${lock}" 2>/dev/null)" || ide=""
-	if [[ "${ide}" != "Zed" ]]; then
-		skip "${port}.lock is not ours (ideName=${ide:-none})"
+	#
+	# But one that ANSWERS is what the clause needs, and `${locks[0]}` is only the
+	# first name `sort` yielded. On 2026-09-22 that was 33223.lock, written at
+	# 08:43 by a process that was already gone: every static clause passed, the
+	# upgrade got an empty response, and the script reported DRIFT -- which claims
+	# the CLI's contract moved when all that happened is that no Zed was running.
+	# An absent Zed is not a broken contract, so it takes the exit this script's
+	# own header already reserves: "0 contract intact (or not askable)".
+	#
+	# Ours AND answering, not merely answering: another IDE's live lock would
+	# otherwise be selected and then rejected by the ideName guard, skipping a
+	# probe a running Zed two entries later could have passed.
+	local candidate lock="" port token ide="" stale=0 foreign=0
+	for candidate in "${locks[@]}"; do
+		if ! lock_answers "${candidate}"; then
+			stale=$((stale + 1))
+			continue
+		fi
+		ide="$(jq -r '.ideName // ""' "${candidate}" 2>/dev/null)" || ide=""
+		if [[ "${ide}" != "Zed" ]]; then
+			foreign=$((foreign + 1))
+			continue
+		fi
+		lock="${candidate}"
+		break
+	done
+	if [[ -z "${lock}" ]]; then
+		skip "$(printf '%d lock files, none of them ours and answering (%d stale, %d another IDE) -- no patched Zed is running' \
+			"${#locks[@]}" "${stale}" "${foreign}")"
 		return 0
 	fi
+	port="$(basename "${lock}" .lock)"
 
 	if [[ "$(jq -r '.useWebSocket // false' "${lock}" 2>/dev/null)" == "true" ]]; then
 		ok "port ${port}: lock file selects the websocket transport"

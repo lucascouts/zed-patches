@@ -1095,6 +1095,147 @@ test_status_calls_the_advisory_step_in_its_own_body() {
 	rm -rf "${tmp}"
 }
 
+# --- check-protocol.sh: which lock file the live clause probes ---------------
+#
+# The live clause is the only part of this tooling that opens a socket, so it is
+# the only one whose fixtures have to answer one. Nothing here reaches the
+# network: the listener binds 127.0.0.1 and the dead ports are ones the kernel
+# has just confirmed nobody holds.
+#
+# PATH is cut to /usr/bin:/bin for these three cases, and that is not a detail.
+# It drops /opt/bin and with it `claude`, so check_cli takes its 'no claude on
+# PATH' skip and the exit code under test belongs to the live clause alone.
+# Keeping the real PATH would have made every case below depend on whether the
+# CLI on this machine still matches five string literals — a coupling that would
+# turn the next CLI release into a red here for a reason unrelated to locks.
+
+# dead_port <start> — the first port at or above <start> that refuses a connect.
+#
+# Low and fixed rather than kernel-allocated, because these lock FILENAMES have
+# to sort lexicographically ahead of the live one: `sort` over the glob is
+# exactly what the old code took, so a fixture whose live lock happens to sort
+# first would pass without testing anything.
+dead_port() {
+	local p="$1"
+	while ((p < 65000)); do
+		if ! timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/${p}" 2>/dev/null; then
+			printf '%s' "${p}"
+			return 0
+		fi
+		p=$((p + 1))
+	done
+	printf '%s' "$1"
+}
+
+# start_listener <port> <readyfile> — a listener that accepts a connection and
+# closes it without speaking websocket: enough to answer a connect, never enough
+# to pass the handshake. Prints its PID.
+#
+# Its stdout and stderr go to /dev/null, which is load-bearing rather than tidy:
+# the caller reads that PID through a command substitution, and a background
+# child inheriting the substitution's pipe holds its write end open for as long
+# as it lives. This one lives until it is killed, so the substitution would never
+# return -- measured as a selftest stuck in anon_pipe_read with no children.
+start_listener() {
+	local port="$1" ready="$2" pid waited=0
+	python3 -c 'import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(8)
+open(sys.argv[2], "w").write("ready")
+while True:
+    c, _ = s.accept()
+    c.close()' "${port}" "${ready}" >/dev/null 2>&1 &
+	pid=$!
+	while [[ ! -s "${ready}" ]] && ((waited < 100)); do
+		sleep 0.05
+		waited=$((waited + 1))
+	done
+	printf '%s' "${pid}"
+}
+
+# make_lock <ide-dir> <port> [ideName] — one ~/.claude/ide lock file.
+make_lock() {
+	local dir="$1" port="$2" ide="${3:-Zed}"
+	mkdir -p "${dir}"
+	printf '{"pid":1,"ideName":"%s","transport":"ws","useWebSocket":true,"authToken":"fixture-token","workspaceFolders":["/tmp"]}\n' \
+		"${ide}" >"${dir}/${port}.lock"
+}
+
+# run_protocol <config-dir> — check-protocol.sh against a fixture lock directory.
+run_protocol() {
+	PATH=/usr/bin:/bin CLAUDE_CONFIG_DIR="$1" \
+		bash "${SCRIPTS}/check-protocol.sh" 2>&1
+}
+
+test_protocol_picks_a_lock_that_answers() {
+	case_start "protocol: the live clause probes the lock whose port answers, not the first name in the glob"
+	local tmp ide out status pid live dead_a dead_b
+	tmp="$(mktemp -d)"
+	ide="${tmp}/ide"
+	dead_a="$(dead_port 10001)"
+	dead_b="$(dead_port $((dead_a + 1)))"
+	live="$(dead_port 64000)"
+	pid="$(start_listener "${live}" "${tmp}/ready")"
+	make_lock "${ide}" "${dead_a}"
+	make_lock "${ide}" "${dead_b}"
+	make_lock "${ide}" "${live}"
+
+	out="$(run_protocol "${tmp}")"
+	status=$?
+	kill "${pid}" 2>/dev/null
+
+	assert_contains "${out}" "port ${live}:" &&
+		assert_not_contains "${out}" "port ${dead_a}:" &&
+		assert_not_contains "${out}" "port ${dead_b}:" && ok
+	rm -rf "${tmp}"
+}
+
+test_protocol_skips_when_no_lock_answers() {
+	case_start "protocol: every lock stale is a skip with exit 0, naming how many were found and how many were dead"
+	local tmp ide out status dead_a dead_b
+	tmp="$(mktemp -d)"
+	ide="${tmp}/ide"
+	dead_a="$(dead_port 10001)"
+	dead_b="$(dead_port $((dead_a + 1)))"
+	make_lock "${ide}" "${dead_a}"
+	make_lock "${ide}" "${dead_b}"
+
+	out="$(run_protocol "${tmp}")"
+	status=$?
+
+	# An absent Zed is not a broken contract: the script's own header reserves
+	# exit 0 for 'contract intact (or not askable)', and this is not askable.
+	assert_status 0 "${status}" &&
+		assert_contains "${out}" "2 lock files" &&
+		assert_contains "${out}" "2 stale" &&
+		assert_not_contains "${out}" "DRIFT" && ok
+	rm -rf "${tmp}"
+}
+
+test_protocol_still_reports_drift_on_an_answering_lock() {
+	case_start "protocol: a lock that answers and then fails the upgrade is still exit 1"
+	local tmp ide out status pid live
+	tmp="$(mktemp -d)"
+	ide="${tmp}/ide"
+	live="$(dead_port 64000)"
+	pid="$(start_listener "${live}" "${tmp}/ready")"
+	make_lock "${ide}" "${live}"
+
+	out="$(run_protocol "${tmp}")"
+	status=$?
+	kill "${pid}" 2>/dev/null
+
+	# The skip must not have eaten the failure it was added beside: 1 keeps
+	# meaning the contract drifted, or status.sh's `|| true` starts swallowing
+	# something different from what it was written to swallow.
+	assert_status 1 "${status}" &&
+		assert_contains "${out}" "DRIFT" &&
+		assert_contains "${out}" "no websocket upgrade" && ok
+	rm -rf "${tmp}"
+}
+
 # --- runner -----------------------------------------------------------------
 
 main() {
@@ -1155,6 +1296,10 @@ main() {
 	test_advisory_skips_only_the_missing_lockfile
 
 	test_status_calls_the_advisory_step_in_its_own_body
+
+	test_protocol_picks_a_lock_that_answers
+	test_protocol_skips_when_no_lock_answers
+	test_protocol_still_reports_drift_on_an_answering_lock
 
 	printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
 	[[ "${FAIL}" -eq 0 ]]
