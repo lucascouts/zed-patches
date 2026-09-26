@@ -372,6 +372,47 @@ _zp_scan_lockfile() {
 	return 0
 }
 
+# report_repo_advisories [--offline] — read the npm lockfiles' production
+# packages against the advisories their own GitHub repositories publish.
+# ALWAYS returns 0, for the reason report_advisories does.
+#
+# A second source because the first is blind in a specific way: npm audit, OSV
+# and Dependabot alerts all read the global advisory database, which carries a
+# repository advisory only after GitHub reviews it. fast-uri 3.1.7 (2026-09-25)
+# and proxy-addr 2.0.7 (2026-09-26) sat in this chain's lockfiles under such
+# advisories with every scanner reporting 0. The work is in repo-advisories.mjs
+# -- range comparison does not belong in shell -- and this only wires it up.
+report_repo_advisories() {
+	local offline=0 arg
+	for arg in "$@"; do
+		case "${arg}" in
+		--offline) offline=1 ;;
+		*) printf 'report_repo_advisories: ignoring unknown argument: %s\n' "${arg}" >&2 ;;
+		esac
+	done
+
+	printf '\n\033[1madvisories (repository-published)\033[0m\n'
+
+	if ((offline == 1)); then
+		_zp_advisory_line skipped '--offline — the advisories are a GitHub API lookup'
+		return 0
+	fi
+	if ! command -v node >/dev/null 2>&1; then
+		_zp_advisory_line skipped 'node is not on PATH'
+		return 0
+	fi
+
+	local token=""
+	if command -v gh >/dev/null 2>&1; then
+		token="$(gh auth token 2>/dev/null)" || token=""
+	fi
+
+	GH_TOKEN="${token}" node "$(_zp_repo_root)/scripts/repo-advisories.mjs" \
+		"$(_zp_chain_root)" "${ZP_NPM_LOCKFILES[@]%/package-lock.json}" ||
+		_zp_advisory_line 'scan failed' 'repo-advisories.mjs exited non-zero'
+	return 0
+}
+
 # report_advisories [--offline] — check the chain's five lockfiles against the
 # OSV database and print one verdict per file. ALWAYS returns 0.
 #
