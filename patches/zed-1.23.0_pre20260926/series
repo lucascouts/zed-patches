@@ -102,12 +102,13 @@
 # failure row beside the entry. Rides this flag BY DEPENDENCY: only this adapter
 # emits that key.
 0017-native-compaction-entry.patch
-# 0026: the two navigation controls at the end of a turn -- scroll to the user
-# message, scroll to the top -- float over the conversation instead of riding
-# inside the last list item, where they scrolled out of view together with the
-# turn that owned them. The copy button deliberately stays inline: it copies one
-# specific response, and a control floating over the whole thread cannot say
-# which. Pure Zed, BY CHOICE, the way 0010, 0012 and 0014 are.
+# 0026: the thread's controls -- copy, previous user message, top, bottom --
+# float over the conversation instead of riding inside the last list item,
+# where they scrolled out of view together with the turn that owned them. Copy
+# and "previous user message" are read off the scroll position: copy takes the
+# turn under the overlay (disabled while that turn is still in progress), and
+# each click on the other lands one user message earlier. Pure Zed, BY CHOICE,
+# the way 0010, 0012 and 0014 are.
 0026-float-thread-navigation-controls.patch
 # 0027: a question the agent asks is pinned above the composer instead of
 # scrolling away with the conversation, and a multi-question one is stepped
