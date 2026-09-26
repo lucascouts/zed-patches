@@ -1,0 +1,158 @@
+From 1d4307794e9f4b373c49c22455f1c88617634ea6 Mon Sep 17 00:00:00 2001
+From: zed-patches <zed-patches@localhost>
+Date: Sun, 13 Sep 2026 13:36:18 -0300
+Subject: [PATCH] zed: register zeo:// and keep accepting zed://
+
+Zeo claims its own URL scheme so that a desktop with both editors installed sends
+each one its own links. The asymmetry is deliberate and is the whole design:
+
+    REGISTER  zeo://  - what the desktop hands to this application
+    ACCEPT    zeo://  and  zed://  - what the application is willing to open
+
+Registering alone would have been the obvious change and it would have broken the
+editor. The scheme is not only an external entry point: Zed builds zed:// URIs
+internally and then parses them back - zed://schemas/<path> in main.rs,
+zed://agent for the agent panel, zed://settings/... - and those generators are
+untouched here. If the accepted prefix moved instead of widening, every one of
+those internal round trips would have started failing, in places with no obvious
+connection to a rebrand.
+
+REBRAND.md D10 summarises this as one line, "URL scheme zed:// -> zeo://". It is
+nine sites with three different natures, and only the first two are safe to move:
+
+  client/src/client.rs - ZED_URL_SCHEME is the single chokepoint, and
+  parse_zed_link is the single parser. A ZEO_URL_SCHEME constant beside it and a
+  second .or_else() arm is the entire acceptance change; everything downstream
+  inherits it.
+
+  install_cli/register_zed_scheme.rs - registers ZEO_URL_SCHEME. This patch only
+  ever applies to app-editors/zeo, so the switch is unconditional rather than
+  channel-keyed: a Zed build never sees it.
+
+  cli/src/main.rs - URL_PREFIX gains "zeo://" (the array length annotation moves
+  5 -> 6, which the compiler enforces).
+
+  zed/src/main.rs - parse_url_arg gains the prefix beside the zed:// it already
+  accepted, next to file://, zed-cli:// and ssh://.
+
+  zed/src/zed.rs - the two user-facing strings that name the scheme being
+  registered. They are text, not behaviour, but a toast announcing "zed:// links
+  will now open in Zeo" after registering zeo:// is simply wrong.
+
+Left alone on purpose: the generators above, and client/src/zed_urls.rs, which
+builds share links against the configured server - REBRAND.md section 3 keeps the
+whole backend as Zed's, and a share link is a zed.dev address, not a brand.
+
+Decision D10 in zeo/docs/REBRAND.md, widened by measurement.
+---
+ crates/cli/src/main.rs                        | 9 ++++++++-
+ crates/client/src/client.rs                   | 7 +++++++
+ crates/install_cli/src/register_zed_scheme.rs | 6 +++---
+ crates/zed/src/main.rs                        | 1 +
+ crates/zed/src/zed.rs                         | 4 ++--
+ 5 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/crates/cli/src/main.rs b/crates/cli/src/main.rs
+index 0f4d674..be97811 100644
+--- a/crates/cli/src/main.rs
++++ b/crates/cli/src/main.rs
+@@ -31,7 +31,14 @@ use walkdir::WalkDir;
+ 
+ use std::io::IsTerminal;
+ 
+-const URL_PREFIX: [&'static str; 5] = ["zed://", "http://", "https://", "file://", "ssh://"];
++const URL_PREFIX: [&'static str; 6] = [
++    "zeo://",
++    "zed://",
++    "http://",
++    "https://",
++    "file://",
++    "ssh://",
++];
+ 
+ struct Detect;
+ 
+diff --git a/crates/client/src/client.rs b/crates/client/src/client.rs
+index c12ea19..c37c077 100644
+--- a/crates/client/src/client.rs
++++ b/crates/client/src/client.rs
+@@ -1941,6 +1941,9 @@ impl ProtoClient for Client {
+ /// prefix for the zed:// url scheme
+ pub const ZED_URL_SCHEME: &str = "zed";
+ 
++/// prefix for the zeo:// url scheme
++pub const ZEO_URL_SCHEME: &str = "zeo";
++
+ /// A parsed Zed link that can be handled internally by the application.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum ZedLink {
+@@ -1966,6 +1969,10 @@ pub fn parse_zed_link(link: &str, cx: &App) -> Option<ZedLink> {
+         .or_else(|| {
+             link.strip_prefix(ZED_URL_SCHEME)
+                 .and_then(|result| result.strip_prefix("://"))
++        })
++        .or_else(|| {
++            link.strip_prefix(ZEO_URL_SCHEME)
++                .and_then(|result| result.strip_prefix("://"))
+         })?;
+ 
+     let mut parts = path.split('/');
+diff --git a/crates/install_cli/src/register_zed_scheme.rs b/crates/install_cli/src/register_zed_scheme.rs
+index 048b2dd..ec48354 100644
+--- a/crates/install_cli/src/register_zed_scheme.rs
++++ b/crates/install_cli/src/register_zed_scheme.rs
+@@ -1,14 +1,14 @@
+-use client::ZED_URL_SCHEME;
++use client::ZEO_URL_SCHEME;
+ use gpui::{AsyncApp, actions};
+ 
+ actions!(
+     cli,
+     [
+-        /// Registers the zed:// URL scheme handler.
++        /// Registers the zeo:// URL scheme handler.
+         RegisterZedScheme
+     ]
+ );
+ 
+ pub async fn register_zed_scheme(cx: &AsyncApp) -> anyhow::Result<()> {
+-    cx.update(|cx| cx.register_url_scheme(ZED_URL_SCHEME)).await
++    cx.update(|cx| cx.register_url_scheme(ZEO_URL_SCHEME)).await
+ }
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index ec31980..e081e1c 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -1812,6 +1812,7 @@ fn parse_url_arg(arg: &str, cx: &App) -> String {
+         Ok(path) => format!("file://{}", path.display()),
+         Err(_) => {
+             if arg.starts_with("file://")
++                || arg.starts_with("zeo://")
+                 || arg.starts_with("zed://")
+                 || arg.starts_with("zed-cli://")
+                 || arg.starts_with("ssh://")
+diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
+index c4bf14e..0e0e33d 100644
+--- a/crates/zed/src/zed.rs
++++ b/crates/zed/src/zed.rs
+@@ -1278,7 +1278,7 @@ fn register_actions(
+                         Toast::new(
+                             NotificationId::unique::<RegisterZedScheme>(),
+                             format!(
+-                                "zed:// links will now open in {}.",
++                                "zeo:// links will now open in {}.",
+                                 ReleaseChannel::global(cx).display_name()
+                             ),
+                         ),
+@@ -1288,7 +1288,7 @@ fn register_actions(
+                 Ok(())
+             })
+             .detach_and_prompt_err(
+-                "Error registering zed:// scheme",
++                "Error registering zeo:// scheme",
+                 window,
+                 cx,
+                 |_, _, _| None,
+-- 
+2.55.0
+

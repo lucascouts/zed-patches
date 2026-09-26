@@ -1,0 +1,483 @@
+From 986d9e7fc9db5a5049353a2cc3884e0c44815086 Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@proton.me>
+Date: Tue, 15 Sep 2026 00:15:58 -0300
+Subject: [PATCH] agent: float the thread-navigation controls over the
+ conversation
+
+The controls at the end of a turn -- copy this response, scroll to the user
+message, scroll to the top -- are rendered by `render_thread_controls` as a row
+*inside* a list item. That puts them in the scroll flow, so they leave the
+viewport together with the turn they belong to. They are therefore out of
+reach in exactly the situation that makes them worth having: a long thread,
+scrolled away from both of its ends.
+
+This moves all of them onto the conversation container as an absolutely
+positioned overlay -- copy, previous user message, top, bottom, in that
+order -- and makes the two that belong to a turn relative to the scroll
+position instead of to the thread's ends.
+
+The first version of this patch floated only the two navigation buttons and
+left copy inline, on the argument that a control floating over the whole
+conversation cannot say which response it means. It can, once "which" is read
+off the scroll position, and leaving it inline had a visible cost: the inline
+copy button of the last turn sat right behind the overlay, covered by it.
+
+- Copy acts on the turn the overlay sits over: the entry under the viewport's
+  bottom edge, found by walking `bounds_for_item` from the scroll top. Over a
+  user message it takes the turn above, since that is the response just read
+  and the reply below has not scrolled into view. It copies what the inline
+  button copied -- `get_agent_message_content`, the agent's text for the whole
+  turn -- and nothing of the user's message or the tool calls.
+
+- Copy is disabled, not hidden, while that turn is still in progress:
+  generating, waiting for a tool confirmation, or holding a pending
+  elicitation. Copying then would hand over a partial response, and a button
+  that appears and disappears with the agent's status reads as a layout
+  glitch. An earlier turn stays copyable while the last one is generated.
+
+- "Scroll to Previous User Message" used to call
+  `scroll_to_user_message_index(None, ..)`, which always resolves to the MOST
+  RECENT user message, so a second click went nowhere. It now searches back
+  from the scroll top, so each click lands one message earlier -- every
+  landing puts that message at the top, and the next search starts above it --
+  and a manual scroll in between is honoured rather than fought. A user
+  message already partly scrolled past counts as the one to return to. It is
+  measured, not counted: no click counter to fall out of sync.
+
+- It is disabled rather than hidden when there is nothing earlier to go to,
+  which covers a thread with no user message at all. It is NOT disabled while
+  generating: moving the viewport is harmless mid-turn and is when it is most
+  wanted.
+
+- "Scroll to Bottom" is new, and is the existing `scroll_to_end`.
+
+- `render_thread_controls` early-returns `Empty` while generating or while a
+  confirmation is pending. That was right for a row carrying a copy button and
+  a turn's stats, and wrong for controls whose job is to move the viewport, so
+  the overlay does not inherit it.
+
+- With the buttons gone, every remaining part of the inline row is optional
+  and they can all be absent at once: turn stats off, feedback unavailable, or
+  simply not the last turn. It now returns `Empty` instead of leaving an
+  invisible band of padding where the buttons used to be. It also loses its
+  `thread`, `entry_ix` and `copy_response_index` parameters with their last
+  use, and the `rposition` search that fed the last one.
+
+This rides on `ThreadView` being re-rendered on every scroll: the list's
+scroll-wheel handler ends in `cx.notify(current_view)`, and the view that
+paints the list is this one, so the enabled state and the copy target are
+recomputed from the current position without a scroll handler of their own.
+
+The overlay clears the vertical scrollbar the same container draws (`right_4`)
+and keeps the inline row's 0.4/1.0 opacity-on-hover, so it reads as the same
+affordance relocated rather than a new one.
+
+Not addressed here: in a thread reopened after a compaction, "Scroll to Top"
+reaches the compaction summary, not the first prompt. That is the adapter's
+history replay stopping at the compact boundary, not this list -- measured
+2026-09-26, and it belongs in the adapter.
+
+Pure Zed: nothing here needs the adapter, so like 0010, 0012 and 0014 it rides
+the claude-agent-acp-plus flag BY CHOICE rather than by dependency.
+---
+
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index a7c65a0..c56e3fa 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -6659,24 +6659,10 @@ impl ThreadView {
+             .unwrap_or(!is_generating);
+ 
+         let primary = if is_turn_end && !assistant_message_is_blank {
+-            let user_message_index = thread
+-                .read(cx)
+-                .entries()
+-                .iter()
+-                .take(entry_ix)
+-                .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)));
+-
+             v_flex()
+                 .w_full()
+                 .child(primary)
+-                .child(self.render_thread_controls(
+-                    &thread,
+-                    entry_ix,
+-                    Some(entry_ix),
+-                    entry_ix + 1 == total_entries,
+-                    user_message_index,
+-                    cx,
+-                ))
++                .child(self.render_thread_controls(entry_ix + 1 == total_entries, cx))
+                 .into_any_element()
+         } else {
+             primary
+@@ -6687,24 +6673,11 @@ impl ThreadView {
+         let comments_editor = self.thread_feedback.comments_editor.clone();
+ 
+         let primary = if entry_ix + 1 == total_entries {
+-            let last_assistant_index = thread
+-                .read(cx)
+-                .entries()
+-                .iter()
+-                .rposition(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)));
+-
+             v_flex()
+                 .w_full()
+                 .child(primary)
+                 .when(!is_assistant, |this| {
+-                    this.child(self.render_thread_controls(
+-                        &thread,
+-                        entry_ix,
+-                        last_assistant_index,
+-                        true,
+-                        None,
+-                        cx,
+-                    ))
++                    this.child(self.render_thread_controls(true, cx))
+                 })
+                 .when_some(comments_editor, |this, editor| {
+                     this.child(Self::render_feedback_feedback_editor(editor, cx))
+@@ -6913,56 +6886,13 @@ impl ThreadView {
+ 
+     fn render_thread_controls(
+         &self,
+-        thread: &Entity<AcpThread>,
+-        entry_ix: usize,
+-        copy_response_index: Option<usize>,
+         is_thread_bottom: bool,
+-        user_message_index: Option<usize>,
+         cx: &Context<Self>,
+     ) -> impl IntoElement {
+-        let is_generating = matches!(thread.read(cx).status(), ThreadStatus::Generating);
+-        let needs_confirmation = thread.read(cx).is_waiting_for_confirmation()
+-            || self.has_pending_request_elicitation(cx);
+-
+-        if is_thread_bottom && (is_generating || needs_confirmation) {
++        if is_thread_bottom && self.is_last_turn_in_progress(cx) {
+             return Empty.into_any_element();
+         }
+ 
+-        let copy_response_button = copy_response_index.map(|response_index| {
+-            IconButton::new(("copy_agent_response", entry_ix), IconName::Copy)
+-                .icon_size(IconSize::Small)
+-                .icon_color(Color::Muted)
+-                .tooltip(Tooltip::text("Copy This Agent Response"))
+-                .on_click(cx.listener(move |this, _, _, cx| {
+-                    let entries = this.thread.read(cx).entries();
+-                    if let Some(text) = Self::get_agent_message_content(entries, response_index, cx)
+-                    {
+-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+-                    }
+-                }))
+-        });
+-
+-        let scroll_to_recent_user_prompt = IconButton::new(
+-            ("scroll_to_recent_user_prompt", entry_ix),
+-            IconName::UserArrowUp,
+-        )
+-        .icon_size(IconSize::Small)
+-        .icon_color(Color::Muted)
+-        .tooltip(Tooltip::text("Scroll to User Message"))
+-        .on_click(cx.listener(move |this, _, _, cx| {
+-            this.scroll_to_user_message_index(user_message_index, cx);
+-        }));
+-
+-        let scroll_to_top = is_thread_bottom.then(|| {
+-            IconButton::new(("scroll_to_top", entry_ix), IconName::ArrowUp)
+-                .icon_size(IconSize::Small)
+-                .icon_color(Color::Muted)
+-                .tooltip(Tooltip::text("Scroll to Top"))
+-                .on_click(cx.listener(move |this, _, _, cx| {
+-                    this.scroll_to_top(cx);
+-                }))
+-        });
+-
+         let show_stats = is_thread_bottom && AgentSettings::get_global(cx).show_turn_stats;
+ 
+         let last_turn_clock = show_stats
+@@ -7050,6 +6980,18 @@ impl ThreadView {
+             })
+             .flatten();
+ 
++        // With the navigation and copy buttons floated, every remaining part is
++        // optional and they can all be absent at once: turn stats off, feedback
++        // unavailable, or simply not the last turn. Rendering
++        // the row regardless leaves an invisible band of padding exactly where
++        // the buttons used to be.
++        if feedback_buttons.is_none()
++            && last_turn_clock.is_none()
++            && last_turn_tokens_label.is_none()
++        {
++            return Empty.into_any_element();
++        }
++
+         let separator_dots = || {
+             Label::new("•")
+                 .size(LabelSize::Small)
+@@ -7081,12 +7023,182 @@ impl ThreadView {
+                 },
+             )
+             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
+-            .when_some(copy_response_button, |this, button| this.child(button))
+-            .child(scroll_to_recent_user_prompt)
+-            .when_some(scroll_to_top, |this, button| this.child(button))
+             .into_any_element()
+     }
+ 
++    /// The thread's navigation controls, as a fixed overlay on the conversation
++    /// instead of a row inside the last entry.
++    ///
++    /// `render_thread_controls` renders *inside* a list item, so the moment the
++    /// turn it belongs to scrolls out of view its controls go with it --
++    /// precisely when these start being useful. Anchoring them on the
++    /// conversation container keeps them reachable from anywhere in the thread.
++    ///
++    /// Two of them are relative to the scroll position rather than to the
++    /// thread's ends, which is what lets a fixed control say which turn it
++    /// means: copy acts on the turn the overlay sits over, and the user-message
++    /// button walks back one message per click.
++    fn render_floating_thread_navigation(&self, cx: &Context<Self>) -> impl IntoElement {
++        let entries = self.thread.read(cx).entries();
++
++        let previous_user_message =
++            Self::previous_user_message_ix(entries, self.list_state.logical_scroll_top());
++
++        // A turn still being written is disabled rather than hidden: copying it
++        // would hand over a partial response, and a button that comes and goes
++        // with the agent's status reads as a layout glitch.
++        let copy_target = self.entry_ix_at_viewport_bottom().and_then(|ix| {
++            let target = Self::turn_copy_target(entries, ix)?;
++            let is_last_turn = !entries
++                .iter()
++                .skip(target + 1)
++                .any(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)));
++            (!is_last_turn || !self.is_last_turn_in_progress(cx)).then_some(target)
++        });
++
++        div()
++            .absolute()
++            // Clear of the vertical scrollbar the same container draws.
++            .right_4()
++            .bottom_2()
++            .child(
++                h_flex()
++                    .gap_0p5()
++                    .p_0p5()
++                    .rounded_md()
++                    .border_1()
++                    .border_color(cx.theme().colors().border)
++                    .bg(cx.theme().colors().elevated_surface_background)
++                    .opacity(0.4)
++                    .hover(|s| s.opacity(1.))
++                    .child(
++                        IconButton::new("floating_copy_agent_response", IconName::Copy)
++                            .icon_size(IconSize::Small)
++                            .icon_color(Color::Muted)
++                            .disabled(copy_target.is_none())
++                            .tooltip(Tooltip::text("Copy This Agent Response"))
++                            .on_click(cx.listener(move |this, _, _, cx| {
++                                let Some(target) = copy_target else {
++                                    return;
++                                };
++                                let entries = this.thread.read(cx).entries();
++                                if let Some(text) =
++                                    Self::get_agent_message_content(entries, target, cx)
++                                {
++                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
++                                }
++                            })),
++                    )
++                    .child(
++                        IconButton::new(
++                            "floating_scroll_to_previous_user_message",
++                            IconName::UserArrowUp,
++                        )
++                        .icon_size(IconSize::Small)
++                        .icon_color(Color::Muted)
++                        .disabled(previous_user_message.is_none())
++                        .tooltip(Tooltip::text("Scroll to Previous User Message"))
++                        .on_click(cx.listener(move |this, _, _, cx| {
++                            if let Some(ix) = previous_user_message {
++                                this.scroll_to_user_message_index(Some(ix), cx);
++                            }
++                        })),
++                    )
++                    .child(
++                        IconButton::new("floating_scroll_to_top", IconName::ArrowUp)
++                            .icon_size(IconSize::Small)
++                            .icon_color(Color::Muted)
++                            .tooltip(Tooltip::text("Scroll to Top"))
++                            .on_click(cx.listener(|this, _, _, cx| {
++                                this.scroll_to_top(cx);
++                            })),
++                    )
++                    .child(
++                        IconButton::new("floating_scroll_to_bottom", IconName::ArrowDown)
++                            .icon_size(IconSize::Small)
++                            .icon_color(Color::Muted)
++                            .tooltip(Tooltip::text("Scroll to Bottom"))
++                            .on_click(cx.listener(|this, _, _, cx| {
++                                this.scroll_to_end(cx);
++                            })),
++                    ),
++            )
++    }
++
++    fn is_last_turn_in_progress(&self, cx: &App) -> bool {
++        let thread = self.thread.read(cx);
++        matches!(thread.status(), ThreadStatus::Generating)
++            || thread.is_waiting_for_confirmation()
++            || self.has_pending_request_elicitation(cx)
++    }
++
++    /// The user message the "previous" control should land on.
++    ///
++    /// It is measured from the scroll position, not from a click counter, so
++    /// repeated clicks walk back one message each -- every landing puts that
++    /// message at the top, and the next search starts above it -- and a manual
++    /// scroll in between is honoured instead of fought. A user message that is
++    /// already partly scrolled past counts as the one to return to.
++    fn previous_user_message_ix(
++        entries: &[AgentThreadEntry],
++        scroll_top: ListOffset,
++    ) -> Option<usize> {
++        let is_user_message =
++            |ix: usize| matches!(entries.get(ix), Some(AgentThreadEntry::UserMessage(_)));
++
++        if scroll_top.offset_in_item > px(0.) && is_user_message(scroll_top.item_ix) {
++            return Some(scroll_top.item_ix);
++        }
++        (0..scroll_top.item_ix.min(entries.len()))
++            .rev()
++            .find(|&ix| is_user_message(ix))
++    }
++
++    /// The entry the floating overlay sits over, i.e. the last one whose top
++    /// is above the viewport's bottom edge.
++    fn entry_ix_at_viewport_bottom(&self) -> Option<usize> {
++        let item_count = self.list_state.item_count();
++        if item_count == 0 {
++            return None;
++        }
++        let viewport_bottom = self.list_state.viewport_bounds().bottom();
++        let mut ix = self.list_state.logical_scroll_top().item_ix.min(item_count - 1);
++        while ix + 1 < item_count {
++            match self.list_state.bounds_for_item(ix) {
++                Some(bounds) if bounds.bottom() < viewport_bottom => ix += 1,
++                _ => break,
++            }
++        }
++        Some(ix)
++    }
++
++    /// The entry whose turn the copy control acts on, given the entry under
++    /// the overlay, or `None` when that turn has no agent response.
++    ///
++    /// Over a user message the overlay sits right below the end of the
++    /// previous turn, which is the response just read, so that turn is the
++    /// one copied rather than the reply that has not scrolled into view yet.
++    fn turn_copy_target(entries: &[AgentThreadEntry], ix: usize) -> Option<usize> {
++        let target = match entries.get(ix)? {
++            AgentThreadEntry::UserMessage(_) => ix.checked_sub(1)?,
++            _ => ix,
++        };
++        let is_user_message =
++            |ix: &usize| matches!(entries.get(*ix), Some(AgentThreadEntry::UserMessage(_)));
++        let start = (0..target)
++            .rev()
++            .find(is_user_message)
++            .map_or(0, |ix| ix + 1);
++        let end = (target..entries.len())
++            .find(is_user_message)
++            .unwrap_or(entries.len());
++        entries
++            .get(start..end)?
++            .iter()
++            .any(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)))
++            .then_some(target)
++    }
++
+     fn is_thread_feedback_enabled(&self, cx: &App) -> bool {
+         util::maybe!({
+             let project = self.thread.read(cx).project().read(cx);
+@@ -12420,9 +12532,11 @@ impl Render for ThreadView {
+             })
+             .map(|this| {
+                 if has_messages {
+-                    this.flex_1()
++                    this.relative()
++                        .flex_1()
+                         .size_full()
+                         .child(self.render_entries(cx))
++                        .child(self.render_floating_thread_navigation(cx))
+                         .vertical_scrollbar_for(&list_state, window, cx)
+                         .into_any()
+                 } else {
+@@ -13038,6 +13152,67 @@ mod tests {
+         }
+     }
+ 
++    #[gpui::test]
++    fn previous_user_message_walks_back_one_message_per_click(cx: &mut gpui::TestAppContext) {
++        cx.update(|cx| {
++            // [User 0, Agent 1, User 2, Agent 3]
++            let entries = conversation_entries(cx);
++            let at = |item_ix: usize, offset: f32| ListOffset {
++                item_ix,
++                offset_in_item: px(offset),
++            };
++
++            // Reading the last response: the first click goes to the last message.
++            assert_eq!(
++                ThreadView::previous_user_message_ix(&entries, at(3, 40.)),
++                Some(2)
++            );
++            // Landed on it: the next click goes one further back, not to it again.
++            assert_eq!(
++                ThreadView::previous_user_message_ix(&entries, at(2, 0.)),
++                Some(0)
++            );
++            // Partly scrolled past a user message: return to that one first.
++            assert_eq!(
++                ThreadView::previous_user_message_ix(&entries, at(2, 10.)),
++                Some(2)
++            );
++            // Already on the first message: nothing earlier, so the button disables.
++            assert_eq!(
++                ThreadView::previous_user_message_ix(&entries, at(0, 0.)),
++                None
++            );
++            assert_eq!(ThreadView::previous_user_message_ix(&[], at(0, 0.)), None);
++        });
++    }
++
++    #[gpui::test]
++    fn copy_targets_the_turn_under_the_overlay(cx: &mut gpui::TestAppContext) {
++        cx.update(|cx| {
++            // [User 0, Agent 1, User 2, Agent 3]
++            let entries = conversation_entries(cx);
++
++            assert_eq!(ThreadView::turn_copy_target(&entries, 3), Some(3));
++            assert_eq!(ThreadView::turn_copy_target(&entries, 1), Some(1));
++            // Over a user message, the response just above it is the one read.
++            assert_eq!(ThreadView::turn_copy_target(&entries, 2), Some(1));
++            // Nothing above the first message, so there is no response to copy.
++            assert_eq!(ThreadView::turn_copy_target(&entries, 0), None);
++            assert_eq!(ThreadView::turn_copy_target(&entries, 4), None);
++
++            // An unanswered prompt at the bottom copies the response above it;
++            // a thread with no response at all has nothing to copy.
++            let unanswered = &entries[..3];
++            assert_eq!(ThreadView::turn_copy_target(unanswered, 2), Some(1));
++            assert_eq!(ThreadView::turn_copy_target(&entries[..1], 0), None);
++
++            let copied = ThreadView::get_agent_message_content(&entries, 1, cx)
++                .expect("the targeted turn has a response");
++            assert!(copied.contains("Result<Args"), "{copied:?}");
++            assert!(!copied.contains("Documented"), "{copied:?}");
++        });
++    }
++
+     #[gpui::test]
+     fn copy_yields_the_users_own_message(cx: &mut gpui::TestAppContext) {
+         cx.update(|cx| {
