@@ -1,4 +1,4 @@
-From dd0b6eb6db270221b6cacafba91f3ead7a919ba9 Mon Sep 17 00:00:00 2001
+From 5cff55efa60c3bec80b2113d8fa2cc4ffd858690 Mon Sep 17 00:00:00 2001
 From: lucascouts <diego.evangelista5642@gmail.com>
 Date: Sat, 5 Sep 2026 20:48:07 -0300
 Subject: [PATCH] feat(agent_ui): let a user copy their own message
@@ -60,7 +60,7 @@ is checked in a running Zed, not here.
 ---
 
 diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
-index 4991806..87162f6 100644
+index 4991806..e884d53 100644
 --- a/crates/agent_ui/src/conversation_view/thread_view.rs
 +++ b/crates/agent_ui/src/conversation_view/thread_view.rs
 @@ -4724,7 +4724,7 @@ impl ThreadView {
@@ -168,7 +168,7 @@ index 4991806..87162f6 100644
 +    fn edited_text(entries: &[acp_thread::AgentThreadEntry], index: usize, cx: &App) -> String {
 +        match &entries[index] {
 +            acp_thread::AgentThreadEntry::UserMessage(message) => {
-+                message.content.to_markdown(cx).to_string()
++                message.content.to_markdown(cx)
 +            }
 +            other => panic!("entry {index} is not a user message: {other:?}"),
 +        }
