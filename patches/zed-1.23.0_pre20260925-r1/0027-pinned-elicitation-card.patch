@@ -1,0 +1,1027 @@
+From 19387f5f24644f456e1f0247181f743ebe7a3b05 Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@protonmail.com>
+Date: Mon, 21 Sep 2026 15:12:19 -0300
+Subject: [PATCH] feat(agent_ui): pin a pending question above the composer,
+ one at a time
+
+A question the agent asks arrives as a session-scoped form elicitation, and
+Zed renders it as an entry in the transcript. It therefore scrolls away with
+the conversation: the turn is blocked waiting for an answer the user can no
+longer see, and the only route back is scrolling to find it. The VS Code
+extension does not do this -- it puts the pending request in a container
+pinned in the chat view, one request at a time.
+
+Zed already has that surface and already fills it with this exact card.
+`ThreadView::render` calls `render_request_elicitations` immediately before
+`render_message_editor`, and `ElicitationCard` draws both. What never reached
+it is the session-scoped half: `handle_create_elicitation` routes
+`ElicitationScope::Session` into the thread's entry list and `Connection`
+into the store the pinned renderer reads. So this is a second reader of the
+first list, not a second renderer.
+
+  * `agent.elicitation_placement` chooses between the two, and the panel's
+    options menu carries both values under an "Agent Questions" header. Two
+    entries of one setting rather than one checkbox: the choice is between
+    two presentations, and a checkbox would have to name one of them and
+    leave the reader to infer the other. It defaults to `card`, which is the
+    one behaviour change here -- `inline` is upstream's, unaltered, and one
+    click away.
+
+  * Only a *pending form* moves. A URL elicitation is a link to follow rather
+    than a question to answer, and a resolved one is already history; pinning
+    either would park something above the composer that nothing is waiting on.
+    Both renderers read one predicate, `renders_elicitation_as_card`, so
+    neither can draw a request the other has drawn too.
+
+  * The cards go in an identified container. The element ids inside a card are
+    keyed by its index, and the connection-scoped cards rendered as their
+    neighbours are keyed by an index into a different list -- an id path of
+    their own is what stops index 0 of one colliding with index 0 of the other.
+
+  * `AcpThread::elicitations()` is new, mirroring what `ElicitationStore`
+    already exposes for the connection-scoped list. The alternative is walking
+    `entries()` -- the whole transcript -- on every frame the panel draws, to
+    find the handful of entries that are elicitations at all.
+
+Pagination is the second half, and it is deliberately narrow.
+
+The adapter packs every question of one AskUserQuestion call into a single
+form: `question_<n>` for the question and `question_<n>_custom` for its own
+"Other" box, the latter marked with an `_askUserQuestionCustomAnswer` `_meta`
+naming the field it belongs to. That marker is un-namespaced on purpose, so
+any client can pair the two, and reading it here is what lets a page hold a
+question together with its own free-text field.
+
+A form that marks *no* companion is not split at all. Nothing else says "these
+fields are separate questions", and an MCP server asking for a host and a port
+is a form to read together -- a wizard over it would hide each field from the
+other for nothing. So an ordinary form comes back as one page and a paginated
+card renders exactly like an unpaginated one.
+
+Two smaller decisions inside it:
+
+  * The pages live on `ElicitationFormState`, computed once from the schema it
+    is already handed. Recomputing them at render would let the page index and
+    the grouping disagree; owning them means `set_page` can clamp and nothing
+    can point past the end.
+
+  * `set_errors` moves to the first page holding an error. Submit is only
+    reachable from the last page, so an error on an earlier one would
+    otherwise reject the form while showing nothing that explains it.
+
+Submission is unchanged: the accept button still sends one response with every
+field, so this is presentation only -- no protocol change, and nothing the
+adapter has to know about.
+
+The two `AgentSettings` struct literals in test modules (`agent_ui`,
+`agent::tool_permissions`) gain the new field; they construct the struct
+exhaustively rather than from defaults.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/assets/settings/default.json b/assets/settings/default.json
+index cbb1bb6..c69a34d 100644
+--- a/assets/settings/default.json
++++ b/assets/settings/default.json
+@@ -1401,6 +1401,14 @@
+     //
+     // Default: false
+     "show_turn_stats": false,
++    // Where a pending form elicitation -- a question the agent asks -- is
++    // shown. URL elicitations are always inline, whatever this says.
++    //
++    // "card":   pinned above the message editor, one question at a time
++    // "inline": in the conversation, all questions at once (upstream Zed)
++    //
++    // Default: card
++    "elicitation_placement": "card",
+     // Whether to show the merge conflict indicator in the status bar
+     // that offers to resolve conflicts using the agent.
+     //
+diff --git a/crates/acp_thread/src/acp_thread.rs b/crates/acp_thread/src/acp_thread.rs
+index 420f88b..8c9011c 100644
+--- a/crates/acp_thread/src/acp_thread.rs
++++ b/crates/acp_thread/src/acp_thread.rs
+@@ -4511,6 +4511,17 @@ impl AcpThread {
+         Some((index, elicitation))
+     }
+ 
++    /// Every elicitation this session has raised, in arrival order.
++    ///
++    /// Mirrors `ElicitationStore::elicitations`, which is what the
++    /// connection-scoped store already exposes. A caller that wants to render
++    /// the pending ones outside the entry list would otherwise have to walk
++    /// `entries()` -- the whole transcript -- to find the handful that are
++    /// elicitations at all.
++    pub fn elicitations(&self) -> &[Elicitation] {
++        self.elicitations.elicitations()
++    }
++
+     pub fn plan(&self) -> &Plan {
+         &self.plan
+     }
+diff --git a/crates/agent/src/tool_permissions.rs b/crates/agent/src/tool_permissions.rs
+index bbb680d..9623ae4 100644
+--- a/crates/agent/src/tool_permissions.rs
++++ b/crates/agent/src/tool_permissions.rs
+@@ -607,6 +607,7 @@ mod tests {
+             tool_permissions,
+             sandbox_permissions: Default::default(),
+             show_turn_stats: false,
++            elicitation_placement: settings::ElicitationPlacement::default(),
+             show_merge_conflict_indicator: true,
+             threads_sidebar: agent_settings::ThreadsSidebarSettings {
+                 auto_open: true,
+diff --git a/crates/agent_settings/src/agent_settings.rs b/crates/agent_settings/src/agent_settings.rs
+index 56f97f6..60b614f 100644
+--- a/crates/agent_settings/src/agent_settings.rs
++++ b/crates/agent_settings/src/agent_settings.rs
+@@ -16,10 +16,11 @@ use project::DisableAiSettings;
+ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+ use settings::{
+-    DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
+-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
+-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
+-    update_settings_file, update_settings_file_with_completion,
++    DockPosition, DockSide, ElicitationPlacement, IntoGpui, LanguageModelParameters,
++    LanguageModelSelection, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting,
++    Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
++    ThinkingBlockDisplay, ToolPermissionMode, update_settings_file,
++    update_settings_file_with_completion,
+ };
+ use util::ResultExt as _;
+ 
+@@ -246,6 +247,7 @@ pub struct AgentSettings {
+     pub use_modifier_to_send: bool,
+     pub message_editor_min_lines: usize,
+     pub show_turn_stats: bool,
++    pub elicitation_placement: ElicitationPlacement,
+     pub show_merge_conflict_indicator: bool,
+     pub tool_permissions: ToolPermissions,
+     pub sandbox_permissions: SandboxPermissions,
+@@ -841,6 +843,7 @@ impl Settings for AgentSettings {
+             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
+             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
+             show_turn_stats: agent.show_turn_stats.unwrap(),
++            elicitation_placement: agent.elicitation_placement.unwrap(),
+             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
+             tool_permissions: compile_tool_permissions(agent.tool_permissions),
+             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
+diff --git a/crates/agent_ui/src/agent_panel.rs b/crates/agent_ui/src/agent_panel.rs
+index dd9f7c2..5a20bd2 100644
+--- a/crates/agent_ui/src/agent_panel.rs
++++ b/crates/agent_ui/src/agent_panel.rs
+@@ -83,7 +83,7 @@ use language::LanguageRegistry;
+ use language_model::LanguageModelRegistry;
+ use notifications::status_toast::StatusToast;
+ use project::{Project, ProjectPath, Worktree};
+-use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
++use settings::{ElicitationPlacement, NotifyWhenAgentWaiting, Settings, update_settings_file};
+ 
+ use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
+ use terminal::Event as TerminalEvent;
+@@ -5600,6 +5600,7 @@ impl AgentPanel {
+             .is_some();
+ 
+         let workspace = self.workspace.clone();
++        let fs = self.fs.clone();
+ 
+         PopoverMenu::new("agent-options-menu")
+             .trigger_with_tooltip(
+@@ -5753,6 +5754,32 @@ impl AgentPanel {
+                             .action("Worktrees", Box::new(zed_actions::git::Worktree))
+                             .action("Toggle Threads Sidebar", Box::new(ToggleWorkspaceSidebar));
+ 
++                        // Where a question from the agent is shown. Two
++                        // entries of one setting rather than a single toggle:
++                        // the choice is between two presentations, and a
++                        // checkbox would have to name one of them and leave
++                        // the reader to infer the other.
++                        let placement = AgentSettings::get_global(cx).elicitation_placement;
++                        menu = menu.separator().header("Agent Questions");
++                        for (label, value) in [
++                            ("Pinned Card", ElicitationPlacement::Card),
++                            ("Inline in the Conversation", ElicitationPlacement::Inline),
++                        ] {
++                            let fs = fs.clone();
++                            menu = menu.toggleable_entry(
++                                label,
++                                placement == value,
++                                IconPosition::End,
++                                None,
++                                move |_window, cx| {
++                                    update_settings_file(fs.clone(), cx, move |settings, _| {
++                                        settings.agent.get_or_insert_default()
++                                            .elicitation_placement = Some(value);
++                                    });
++                                },
++                            );
++                        }
++
+                         if has_auth_methods || supports_logout {
+                             menu = menu.separator()
+                         }
+diff --git a/crates/agent_ui/src/agent_ui.rs b/crates/agent_ui/src/agent_ui.rs
+index dc4921a..fcce64d 100644
+--- a/crates/agent_ui/src/agent_ui.rs
++++ b/crates/agent_ui/src/agent_ui.rs
+@@ -1010,6 +1010,7 @@ mod tests {
+             tool_permissions: Default::default(),
+             sandbox_permissions: Default::default(),
+             show_turn_stats: false,
++            elicitation_placement: settings::ElicitationPlacement::default(),
+             show_merge_conflict_indicator: true,
+             threads_sidebar: agent_settings::ThreadsSidebarSettings {
+                 auto_open: true,
+diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
+index 0208c36..a146bdd 100644
+--- a/crates/agent_ui/src/conversation_view.rs
++++ b/crates/agent_ui/src/conversation_view.rs
+@@ -2560,22 +2560,37 @@ impl ConversationView {
+                     .log_err();
+                 }
+             },
+-            move |elicitation_id, field_name, value, preview_text, cx| {
+-                view.update(cx, |this, cx| {
+-                    let toggled = if let Some(form) = this
+-                        .request_elicitation_form_states
+-                        .get_mut(&elicitation_id)
+-                    {
+-                        form.toggle_preview(&field_name, &value, &preview_text, cx);
+-                        true
+-                    } else {
+-                        false
+-                    };
+-                    if toggled {
+-                        this.notify_request_elicitation_renderers(cx);
+-                    }
+-                })
+-                .log_err();
++            {
++                let view = view.clone();
++                move |elicitation_id, field_name, value, preview_text, cx| {
++                    view.update(cx, |this, cx| {
++                        let toggled = if let Some(form) = this
++                            .request_elicitation_form_states
++                            .get_mut(&elicitation_id)
++                        {
++                            form.toggle_preview(&field_name, &value, &preview_text, cx);
++                            true
++                        } else {
++                            false
++                        };
++                        if toggled {
++                            this.notify_request_elicitation_renderers(cx);
++                        }
++                    })
++                    .log_err();
++                }
++            },
++            {
++                move |elicitation_id, page, cx| {
++                    view.update(cx, |this, cx| {
++                        this.update_request_elicitation_form_state(
++                            &elicitation_id,
++                            |form| form.set_page(page),
++                            cx,
++                        );
++                    })
++                    .log_err();
++                }
+             },
+         )
+     }
+diff --git a/crates/agent_ui/src/conversation_view/elicitation.rs b/crates/agent_ui/src/conversation_view/elicitation.rs
+index 6b8c2d8..c6afdbd 100644
+--- a/crates/agent_ui/src/conversation_view/elicitation.rs
++++ b/crates/agent_ui/src/conversation_view/elicitation.rs
+@@ -52,6 +52,13 @@ pub(crate) struct ElicitationFormState {
+     expanded_previews: HashSet<(String, String)>,
+     preview_markdown: HashMap<(String, String), Entity<Markdown>>,
+     is_submitting: bool,
++    /// The form's fields grouped into the pages a paginated card shows one at
++    /// a time. Computed once from the schema, and owned here rather than
++    /// recomputed at render, so the page index can never point at a grouping
++    /// the renderer disagrees with.
++    pages: Vec<Vec<SharedString>>,
++    /// Index into `pages`. Always in range: every mutator clamps it.
++    page: usize,
+ }
+ 
+ impl ElicitationFormState {
+@@ -126,9 +133,25 @@ impl ElicitationFormState {
+             expanded_previews: HashSet::default(),
+             preview_markdown: HashMap::default(),
+             is_submitting: false,
++            pages: form_pages(schema),
++            page: 0,
+         }
+     }
+ 
++    /// The field groups a paginated card steps through. One entry when the
++    /// form is a single question, or when nothing about it is paginable.
++    pub(crate) fn pages(&self) -> &[Vec<SharedString>] {
++        &self.pages
++    }
++
++    pub(crate) fn page(&self) -> usize {
++        self.page.min(self.pages.len().saturating_sub(1))
++    }
++
++    pub(crate) fn set_page(&mut self, page: usize) {
++        self.page = page.min(self.pages.len().saturating_sub(1));
++    }
++
+     fn snapshot(&self, cx: &App) -> ElicitationFormSubmission {
+         ElicitationFormSubmission {
+             fields: self
+@@ -189,6 +212,16 @@ impl ElicitationFormState {
+     pub(crate) fn set_errors(&mut self, errors: HashMap<String, SharedString>) {
+         self.field_errors = errors;
+         self.is_submitting = false;
++        // Submit is only reachable from the last page, so an error on an
++        // earlier one would otherwise reject the form while showing nothing
++        // that explains it. Move to the first page that has one.
++        if let Some(page) = self.pages.iter().position(|fields| {
++            fields
++                .iter()
++                .any(|field| self.field_errors.contains_key(field.as_ref()))
++        }) {
++            self.page = page;
++        }
+     }
+ 
+     pub(crate) fn set_field_error(
+@@ -416,11 +449,13 @@ mod tests {
+         elicitation: Elicitation,
+         form_state: ElicitationFormState,
+         events: Rc<RefCell<Vec<String>>>,
++        paginated: bool,
+     }
+ 
+     impl TestElicitationView {
+         fn new(schema: acp::ElicitationSchema, window: &mut Window, cx: &mut App) -> Self {
+             Self {
++                paginated: false,
+                 form_state: ElicitationFormState::new(&schema, window, cx),
+                 elicitation: Elicitation {
+                     id: ElicitationEntryId("keyboard-test".into()),
+@@ -434,6 +469,13 @@ mod tests {
+             }
+         }
+ 
++        fn paginated(schema: acp::ElicitationSchema, window: &mut Window, cx: &mut App) -> Self {
++            Self {
++                paginated: true,
++                ..Self::new(schema, window, cx)
++            }
++        }
++
+         fn editor(&self, field_name: &str) -> Entity<Editor> {
+             match self.form_state.fields.get(field_name) {
+                 Some(ElicitationFieldState::Text(editor)) => editor.clone(),
+@@ -491,6 +533,12 @@ mod tests {
+                         events.borrow_mut().push(format!("preview: {name}/{value}"));
+                     })
+                 },
++                on_page_change: {
++                    let events = self.events.clone();
++                    Rc::new(move |_, page, _| {
++                        events.borrow_mut().push(format!("page: {page}"));
++                    })
++                },
+             };
+ 
+             div()
+@@ -509,6 +557,7 @@ mod tests {
+                         Some(&self.form_state),
+                         handlers,
+                     )
++                    .paginated(self.paginated)
+                     .render(cx),
+                 )
+         }
+@@ -1165,6 +1214,162 @@ mod tests {
+         });
+     }
+ 
++    /// A free-text field carrying the marker that pairs it with `question_id`
++    /// -- what the adapter emits beside every question it asks.
++    fn custom_answer_field(question_id: &str) -> acp::StringPropertySchema {
++        let mut schema = acp::StringPropertySchema::new().title("Other");
++        let mut meta = serde_json::Map::new();
++        meta.insert(
++            ASK_USER_QUESTION_CUSTOM_ANSWER_META_KEY.to_string(),
++            serde_json::json!({ "questionId": question_id, "isCustomAnswer": true }),
++        );
++        schema.meta = Some(meta);
++        schema
++    }
++
++    /// Two questions, each with its own "Other" box: the shape an
++    /// AskUserQuestion call with two questions arrives in.
++    fn two_question_schema() -> acp::ElicitationSchema {
++        acp::ElicitationSchema::new()
++            .property(
++                "question_0",
++                acp::StringPropertySchema::new()
++                    .enum_values(vec!["first".to_string(), "second".to_string()]),
++                false,
++            )
++            .property("question_0_custom", custom_answer_field("question_0"), false)
++            .property(
++                "question_1",
++                acp::StringPropertySchema::new()
++                    .enum_values(vec!["third".to_string(), "fourth".to_string()]),
++                false,
++            )
++            .property("question_1_custom", custom_answer_field("question_1"), false)
++    }
++
++    #[test]
++    fn form_pages_pair_each_question_with_its_own_custom_answer_box() {
++        assert_eq!(
++            form_pages(&two_question_schema()),
++            vec![
++                vec![
++                    SharedString::from("question_0"),
++                    SharedString::from("question_0_custom")
++                ],
++                vec![
++                    SharedString::from("question_1"),
++                    SharedString::from("question_1_custom")
++                ],
++            ]
++        );
++    }
++
++    #[test]
++    fn form_pages_keep_a_custom_answer_whose_question_is_absent() {
++        let schema = acp::ElicitationSchema::new().property(
++            "question_9_custom",
++            custom_answer_field("question_9"),
++            false,
++        );
++        assert_eq!(
++            form_pages(&schema),
++            vec![vec![SharedString::from("question_9_custom")]],
++            "a field nobody can reach is worse than one on a page of its own"
++        );
++    }
++
++    #[test]
++    fn form_pages_leave_a_form_that_marks_no_questions_on_one_page() {
++        let schema = acp::ElicitationSchema::new()
++            .string("host", true)
++            .string("port", true);
++        assert_eq!(
++            form_pages(&schema),
++            vec![vec![SharedString::from("host"), SharedString::from("port")]],
++            "an ordinary form is read together, not stepped through"
++        );
++    }
++
++    #[gpui::test]
++    fn set_errors_reveals_the_page_that_holds_one(cx: &mut TestAppContext) {
++        crate::conversation_view::tests::init_test(cx);
++
++        cx.add_window(|window, cx| {
++            let mut form_state = ElicitationFormState::new(&two_question_schema(), window, cx);
++            assert_eq!(form_state.page(), 0);
++
++            form_state.set_errors(HashMap::from_iter([(
++                "question_1".to_string(),
++                SharedString::from("pick one"),
++            )]));
++            assert_eq!(
++                form_state.page(),
++                1,
++                "submit is only reachable from the last page, so an error on \
++                 an earlier one has to bring its page with it"
++            );
++
++            Editor::single_line(window, cx)
++        });
++    }
++
++    #[gpui::test]
++    fn set_page_cannot_leave_the_form(cx: &mut TestAppContext) {
++        crate::conversation_view::tests::init_test(cx);
++
++        cx.add_window(|window, cx| {
++            let mut form_state = ElicitationFormState::new(&two_question_schema(), window, cx);
++            form_state.set_page(99);
++            assert_eq!(form_state.page(), 1);
++
++            Editor::single_line(window, cx)
++        });
++    }
++
++    #[gpui::test]
++    fn paginated_form_advances_before_it_submits(cx: &mut TestAppContext) {
++        init_keyboard_test(cx);
++        let (view, cx) = cx.add_window_view(|window, cx| {
++            TestElicitationView::paginated(two_question_schema(), window, cx)
++        });
++        let (editor, events) = view.read_with(cx, |view, _| {
++            (view.editor("question_0_custom"), view.events.clone())
++        });
++
++        // The first page ends at its own "Other" box, so the next focusable
++        // is the action row -- and on any page but the last that button
++        // advances rather than answering for the questions still unseen.
++        cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
++        press_keys(cx, "tab enter");
++        assert_eq!(*events.borrow(), ["page: 1"]);
++
++        // On the last page the row grows a "Back" in front, so the same two
++        // keystrokes land one button earlier -- and only the button after it
++        // answers the request.
++        view.update(cx, |view, _| view.form_state.set_page(1));
++        events.borrow_mut().clear();
++        let editor = view.read_with(cx, |view, _| view.editor("question_1_custom"));
++        cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
++        press_keys(cx, "tab enter");
++        assert_eq!(*events.borrow(), ["page: 0"]);
++        press_keys(cx, "tab enter");
++        assert_eq!(*events.borrow(), ["page: 0", "submit"]);
++    }
++
++    #[gpui::test]
++    fn an_unpaginated_card_submits_from_the_first_question(cx: &mut TestAppContext) {
++        init_keyboard_test(cx);
++        let (view, cx) = cx
++            .add_window_view(|window, cx| TestElicitationView::new(two_question_schema(), window, cx));
++        let (editor, events) = view.read_with(cx, |view, _| {
++            (view.editor("question_1_custom"), view.events.clone())
++        });
++
++        cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
++        press_keys(cx, "tab enter");
++        assert_eq!(*events.borrow(), ["submit"]);
++    }
++
+     #[gpui::test]
+     fn form_state_reports_all_validation_errors(cx: &mut TestAppContext) {
+         crate::conversation_view::tests::init_test(cx);
+@@ -1698,6 +1903,100 @@ fn ask_user_question_option_preview(meta: Option<&acp::Meta>) -> Option<String>
+         .map(|preview| preview.to_string())
+ }
+ 
++/// Shared `_meta` key marking a free-text field as the custom-answer companion
++/// of a select field — the "Other" box that belongs to one specific question.
++///
++/// Deliberately *not* namespaced to any agent, and that is the adapter's
++/// choice, not an omission: the same marker is meant to be recognised across
++/// every AskUserQuestion bridge. Reading it here is what lets a page hold a
++/// question together with its own free-text box instead of splitting the two
++/// across two pages.
++const ASK_USER_QUESTION_CUSTOM_ANSWER_META_KEY: &str = "_askUserQuestionCustomAnswer";
++
++/// The `_meta` of a property schema, for the variants that carry one.
++///
++/// `Other` is the untagged custom/future variant: it keeps its payload as raw
++/// JSON under `fields` and has no typed `_meta`, so it answers `None` rather
++/// than being parsed speculatively.
++fn property_meta(property: &acp::ElicitationPropertySchema) -> Option<&acp::Meta> {
++    match property {
++        acp::ElicitationPropertySchema::String(schema) => schema.meta.as_ref(),
++        acp::ElicitationPropertySchema::Number(schema) => schema.meta.as_ref(),
++        acp::ElicitationPropertySchema::Integer(schema) => schema.meta.as_ref(),
++        acp::ElicitationPropertySchema::Boolean(schema) => schema.meta.as_ref(),
++        acp::ElicitationPropertySchema::Array(schema) => schema.meta.as_ref(),
++        _ => None,
++    }
++}
++
++/// The field this one is the custom-answer companion of, if it is one.
++/// Tolerant in the same way as the option previews above: an absent key, a
++/// non-object entry or a wrong-typed field all yield `None`, never an error.
++fn custom_answer_companion_of(property: &acp::ElicitationPropertySchema) -> Option<&str> {
++    property_meta(property)?
++        .get(ASK_USER_QUESTION_CUSTOM_ANSWER_META_KEY)?
++        .as_object()?
++        .get("questionId")?
++        .as_str()
++}
++
++/// Split a form's fields into the pages a paginated card shows one at a time.
++///
++/// A page is one field plus every companion that names it, so a question and
++/// its own "Other" box stay together. Fields keep schema order, which for a
++/// `BTreeMap` is the key order the agent chose. A companion naming a field
++/// this schema does not have opens its own page instead of vanishing — a
++/// field the user cannot reach is worse than one on a page of its own.
++///
++/// A form that marks no field as a companion is **not** split at all: it comes
++/// back as one page holding everything. Only the marker says "these fields are
++/// separate questions"; without it the fields are a form to read together --
++/// an MCP server asking for a host and a port -- and putting the second on a
++/// page that hides the first would be a wizard nobody asked for.
++///
++/// A form with one question therefore yields one page, which is how a
++/// paginated card ends up looking exactly like an unpaginated one.
++fn form_pages(schema: &acp::ElicitationSchema) -> Vec<Vec<SharedString>> {
++    let marks_questions = schema
++        .properties
++        .values()
++        .any(|property| custom_answer_companion_of(property).is_some());
++    if !marks_questions {
++        return vec![
++            schema
++                .properties
++                .keys()
++                .map(|name| SharedString::from(name.clone()))
++                .collect(),
++        ];
++    }
++
++    let mut pages: Vec<Vec<SharedString>> = Vec::new();
++    let mut page_of_field: HashMap<&str, usize> = HashMap::default();
++
++    for (name, property) in &schema.properties {
++        let is_companion = custom_answer_companion_of(property)
++            .is_some_and(|target| schema.properties.contains_key(target));
++        if is_companion {
++            continue;
++        }
++        page_of_field.insert(name.as_str(), pages.len());
++        pages.push(vec![SharedString::from(name.clone())]);
++    }
++
++    for (name, property) in &schema.properties {
++        let Some(target) = custom_answer_companion_of(property) else {
++            continue;
++        };
++        let Some(&page) = page_of_field.get(target) else {
++            continue;
++        };
++        pages[page].push(SharedString::from(name.clone()));
++    }
++
++    pages
++}
++
+ /// Wrap an HTML-looking preview in a fenced code block so Markdown renders it as
+ /// escaped plain text — the card never renders raw HTML.
+ fn preview_markdown_source(preview: &str) -> String {
+@@ -2010,6 +2309,7 @@ type RespondHandler = Rc<dyn Fn(ElicitationEntryId, &mut Window, &mut App)>;
+ type OpenUrlHandler = Rc<dyn Fn(ElicitationEntryId, String, &mut Window, &mut App)>;
+ type BooleanHandler = Rc<dyn Fn(ElicitationEntryId, String, bool, &mut App)>;
+ type SelectHandler = Rc<dyn Fn(ElicitationEntryId, String, String, &mut App)>;
++type PageHandler = Rc<dyn Fn(ElicitationEntryId, usize, &mut App)>;
+ type MultiSelectHandler = Rc<dyn Fn(ElicitationEntryId, String, String, bool, &mut App)>;
+ type TogglePreviewHandler = Rc<dyn Fn(ElicitationEntryId, String, String, String, &mut App)>;
+ 
+@@ -2024,6 +2324,7 @@ pub(crate) struct ElicitationCardHandlers {
+     on_single_select_change: SelectHandler,
+     on_multi_select_change: MultiSelectHandler,
+     on_toggle_preview: TogglePreviewHandler,
++    on_page_change: PageHandler,
+ }
+ 
+ impl ElicitationCardHandlers {
+@@ -2037,6 +2338,7 @@ impl ElicitationCardHandlers {
+         on_single_select_change: impl Fn(ElicitationEntryId, String, String, &mut App) + 'static,
+         on_multi_select_change: impl Fn(ElicitationEntryId, String, String, bool, &mut App) + 'static,
+         on_toggle_preview: impl Fn(ElicitationEntryId, String, String, String, &mut App) + 'static,
++        on_page_change: impl Fn(ElicitationEntryId, usize, &mut App) + 'static,
+     ) -> Self {
+         Self {
+             on_submit: Rc::new(on_submit),
+@@ -2048,6 +2350,7 @@ impl ElicitationCardHandlers {
+             on_single_select_change: Rc::new(on_single_select_change),
+             on_multi_select_change: Rc::new(on_multi_select_change),
+             on_toggle_preview: Rc::new(on_toggle_preview),
++            on_page_change: Rc::new(on_page_change),
+         }
+     }
+ 
+@@ -2062,6 +2365,7 @@ impl ElicitationCardHandlers {
+             |_, _, _, _| {},
+             |_, _, _, _, _| {},
+             |_, _, _, _, _| {},
++            |_, _, _| {},
+         )
+     }
+ }
+@@ -2133,6 +2437,7 @@ pub(crate) struct ElicitationCard<'a> {
+     requester_name: SharedString,
+     form_state: Option<&'a ElicitationFormState>,
+     handlers: ElicitationCardHandlers,
++    paginated: bool,
+ }
+ 
+ impl<'a> ElicitationCard<'a> {
+@@ -2149,7 +2454,37 @@ impl<'a> ElicitationCard<'a> {
+             requester_name,
+             form_state,
+             handlers,
++            paginated: false,
++        }
++    }
++
++    /// Step through the form one question at a time instead of putting all of
++    /// them on screen at once. Opt-in, and honoured only where it can mean
++    /// something -- see [`Self::pagination`].
++    pub(crate) fn paginated(mut self, paginated: bool) -> Self {
++        self.paginated = paginated;
++        self
++    }
++
++    /// `(current page, every page)` when this card is stepping through a form,
++    /// `None` when it renders the whole thing at once.
++    ///
++    /// `None` covers four situations that mean the same to the renderer: the
++    /// caller did not ask for it; the request is a URL rather than a form; the
++    /// form is no longer pending, so there is nothing left to fill in; or it
++    /// splits into a single page, where paging controls would be furniture
++    /// around one question.
++    fn pagination(&self) -> Option<(usize, &'a [Vec<SharedString>])> {
++        if !self.paginated
++            || !matches!(self.elicitation.request.mode, acp::ElicitationMode::Form(_))
++            || !matches!(self.elicitation.status, ElicitationStatus::Pending { .. })
++        {
++            return None;
+         }
++
++        let state = self.form_state?;
++        let pages = state.pages();
++        (pages.len() > 1).then(|| (state.page(), pages))
+     }
+ 
+     pub(crate) fn render(self, cx: &App) -> Div {
+@@ -2240,6 +2575,10 @@ impl<'a> ElicitationCard<'a> {
+         let Some(state) = self.form_state else {
+             return Empty.into_any_element();
+         };
++        let pagination = self.pagination();
++        // The fields this render is allowed to draw. `None` means all of them,
++        // which is both the unpaginated card and every single-page form.
++        let visible_fields = pagination.map(|(page, pages)| pages[page].as_slice());
+ 
+         v_flex()
+             .gap_2()
+@@ -2256,8 +2595,24 @@ impl<'a> ElicitationCard<'a> {
+                     )
+                 },
+             )
++            .when_some(pagination, |this, (page, pages)| {
++                // Without this the card gives no sign that more is coming, and
++                // "Next" reads as if it skipped the question.
++                this.child(
++                    Label::new(format!("Question {} of {}", page + 1, pages.len()))
++                        .size(LabelSize::Small)
++                        .color(Color::Muted),
++                )
++            })
+             .children(mode.requested_schema.properties.iter().filter_map(
+                 |(field_name, property)| {
++                    if let Some(visible_fields) = visible_fields
++                        && !visible_fields
++                            .iter()
++                            .any(|visible| visible.as_ref() == field_name.as_str())
++                    {
++                        return None;
++                    }
+                     let field = state.fields.get(field_name)?;
+                     Some(self.render_field(
+                         field_name,
+@@ -2752,10 +3107,22 @@ impl<'a> ElicitationCard<'a> {
+         let is_accepted_url =
+             open_url.is_some() && matches!(self.elicitation.status, ElicitationStatus::Accepted);
+         let is_submitting = self.form_state.is_some_and(|state| state.is_submitting);
++        // On every page but the last the primary button advances instead of
++        // submitting: a paginated form must not be answerable from a page that
++        // shows one of its questions.
++        let pagination = self.pagination();
++        let next_page = pagination
++            .filter(|(page, pages)| page + 1 < pages.len())
++            .map(|(page, _)| page + 1);
++        let previous_page = pagination
++            .filter(|(page, _)| *page > 0)
++            .map(|(page, _)| page - 1);
+         let (accept_label, accept_icon, accept_icon_color) = if is_accepted_url {
+             ("Open Again", IconName::ArrowUpRight, Color::Muted)
+         } else if open_url.is_some() {
+             ("Open", IconName::ArrowUpRight, Color::Muted)
++        } else if next_page.is_some() {
++            ("Next", IconName::ArrowRight, Color::Muted)
+         } else {
+             ("Submit", IconName::Check, Color::Success)
+         };
+@@ -2765,7 +3132,10 @@ impl<'a> ElicitationCard<'a> {
+         let on_decline = self.handlers.on_decline.clone();
+         let on_cancel = self.handlers.on_cancel.clone();
+         let on_dismiss_url = self.handlers.on_dismiss_url.clone();
++        let on_page_change = self.handlers.on_page_change.clone();
++        let back_page_change = on_page_change.clone();
+         let submit_id = self.elicitation.id.clone();
++        let back_id = self.elicitation.id.clone();
+         let decline_id = self.elicitation.id.clone();
+         let cancel_id = self.elicitation.id.clone();
+         let dismiss_id = self.elicitation.id.clone();
+@@ -2777,6 +3147,22 @@ impl<'a> ElicitationCard<'a> {
+             .justify_end()
+             .border_t_1()
+             .border_color(border_color)
++            .when_some(previous_page, |this, previous_page| {
++                this.child(
++                    Button::new(("elicitation-back", self.entry_ix), "Back")
++                        .tab_index(0_isize)
++                        .start_icon(
++                            Icon::new(IconName::ArrowLeft)
++                                .size(IconSize::XSmall)
++                                .color(Color::Muted),
++                        )
++                        .label_size(LabelSize::Small)
++                        .disabled(is_submitting)
++                        .on_click(move |_, _window, cx| {
++                            back_page_change(back_id.clone(), previous_page, cx);
++                        }),
++                )
++            })
+             .child(
+                 Button::new(("elicitation-accept", self.entry_ix), accept_label)
+                     .tab_index(0_isize)
+@@ -2793,6 +3179,8 @@ impl<'a> ElicitationCard<'a> {
+                             if !is_accepted_url {
+                                 on_submit(submit_id.clone(), window, cx);
+                             }
++                        } else if let Some(next_page) = next_page {
++                            on_page_change(submit_id.clone(), next_page, cx);
+                         } else {
+                             on_submit(submit_id.clone(), window, cx);
+                         }
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index 47f59c8..00fa739 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -41,7 +41,7 @@ use language_model::{
+     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
+ };
+ use notifications::status_toast::StatusToast;
+-use settings::{update_settings_file, update_settings_file_with_completion};
++use settings::{ElicitationPlacement, update_settings_file, update_settings_file_with_completion};
+ use ui::{
+     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
+     SplitButtonStyle, Tab, ToggleState,
+@@ -6566,6 +6566,7 @@ impl ThreadView {
+                 let thread = self.thread.read(cx);
+                 if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
+                     && should_render_elicitation(elicitation)
++                    && !Self::renders_elicitation_as_card(elicitation, cx)
+                 {
+                     let elicitation = self.render_elicitation(entry_ix, elicitation, window, cx);
+ 
+@@ -6824,10 +6825,22 @@ impl ThreadView {
+                     .log_err();
+                 }
+             },
+-            move |elicitation_id, field_name, value, preview_text, cx| {
++            {
++                let view = view.clone();
++                move |elicitation_id, field_name, value, preview_text, cx| {
++                    view.update(cx, |this, cx| {
++                        if let Some(form) = this.elicitation_form_states.get_mut(&elicitation_id) {
++                            form.toggle_preview(&field_name, &value, &preview_text, cx);
++                            cx.notify();
++                        }
++                    })
++                    .log_err();
++                }
++            },
++            move |elicitation_id, page, cx| {
+                 view.update(cx, |this, cx| {
+                     if let Some(form) = this.elicitation_form_states.get_mut(&elicitation_id) {
+-                        form.toggle_preview(&field_name, &value, &preview_text, cx);
++                        form.set_page(page);
+                         cx.notify();
+                     }
+                 })
+@@ -7169,6 +7182,65 @@ impl ThreadView {
+         self.message_editor.read(cx).set_local_commands(commands);
+     }
+ 
++    /// Whether this elicitation is drawn by the pinned card above the message
++    /// editor rather than inline, in the conversation.
++    ///
++    /// Only a pending *form* moves. A URL elicitation is a link to follow, not
++    /// a question to answer, and a resolved one is already history -- pinning
++    /// either would park something above the composer that nothing is waiting
++    /// on. Both renderers read this one predicate, so neither can draw a
++    /// request the other has drawn too.
++    fn renders_elicitation_as_card(elicitation: &Elicitation, cx: &App) -> bool {
++        AgentSettings::get_global(cx).elicitation_placement == ElicitationPlacement::Card
++            && matches!(elicitation.request.mode, acp::ElicitationMode::Form(_))
++            && matches!(elicitation.status, ElicitationStatus::Pending { .. })
++    }
++
++    /// The pending form elicitations this thread is waiting on, rendered above
++    /// the message editor instead of in the conversation -- where a question
++    /// asked twenty entries ago is still on screen, and still answerable,
++    /// after the transcript has scrolled past it.
++    ///
++    /// Reads the thread's own elicitation list rather than walking `entries()`:
++    /// that list holds nothing but elicitations and stays short, while the
++    /// transcript is neither, and this runs on every frame the panel draws.
++    ///
++    /// The cards go inside an identified container because the element ids
++    /// within a card are keyed by its index, and the connection-scoped cards
++    /// rendered alongside them are keyed by an index into a different list.
++    /// An id path of their own is what stops index 0 of one colliding with
++    /// index 0 of the other.
++    fn render_pinned_elicitations(&self, cx: &Context<Self>) -> Option<AnyElement> {
++        let handlers = self.elicitation_card_handlers(cx);
++        let cards = self
++            .thread
++            .read(cx)
++            .elicitations()
++            .iter()
++            .enumerate()
++            .filter(|(_, elicitation)| Self::renders_elicitation_as_card(elicitation, cx))
++            .map(|(ix, elicitation)| {
++                ElicitationCard::new(
++                    ix,
++                    elicitation,
++                    self.agent_display_name.clone(),
++                    self.elicitation_form_states.get(&elicitation.id),
++                    handlers.clone(),
++                )
++                .paginated(true)
++                .render(cx)
++                .into_any_element()
++            })
++            .collect::<Vec<_>>();
++
++        (!cards.is_empty()).then(|| {
++            v_flex()
++                .id("pinned-elicitations")
++                .children(cards)
++                .into_any_element()
++        })
++    }
++
+     fn render_request_elicitations(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+         let server_view = self.server_view.clone();
+         let handlers_view = server_view.clone();
+@@ -12809,6 +12881,7 @@ impl Render for ThreadView {
+                 |this, version| this.child(self.render_new_version_callout(&version, cx)),
+             )
+             .children(self.render_token_limit_callout(cx))
++            .children(self.render_pinned_elicitations(cx))
+             .children(self.render_request_elicitations(cx))
+             .child(self.render_message_editor(window, cx))
+     }
+diff --git a/crates/settings_content/src/agent.rs b/crates/settings_content/src/agent.rs
+index d8c755e..cf7c86b 100644
+--- a/crates/settings_content/src/agent.rs
++++ b/crates/settings_content/src/agent.rs
+@@ -97,6 +97,33 @@ pub enum ThinkingBlockDisplay {
+     AlwaysCollapsed,
+ }
+ 
++/// Where a pending form elicitation -- a question the agent asks -- is shown.
++#[derive(
++    Clone,
++    Copy,
++    Debug,
++    Default,
++    PartialEq,
++    Eq,
++    Serialize,
++    Deserialize,
++    JsonSchema,
++    MergeFrom,
++    strum::VariantArray,
++    strum::VariantNames,
++)]
++#[serde(rename_all = "snake_case")]
++pub enum ElicitationPlacement {
++    /// Pinned above the message editor, one question at a time, where it stays
++    /// in view while the conversation scrolls behind it.
++    #[default]
++    Card,
++    /// Inline in the conversation, at the point the agent asked. Upstream Zed's
++    /// behaviour: every question of a request at once, scrolling away with the
++    /// entry that carries them.
++    Inline,
++}
++
+ /// Threshold at which agent auto-compaction runs. See
+ /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
+ ///
+@@ -381,6 +408,11 @@ pub struct AgentSettingsContent {
+     ///
+     /// Default: false
+     pub show_turn_stats: Option<bool>,
++    /// Where a pending form elicitation -- a question the agent asks -- is
++    /// shown. URL elicitations are always inline, whatever this says.
++    ///
++    /// Default: card
++    pub elicitation_placement: Option<ElicitationPlacement>,
+     /// Whether to show the merge conflict indicator in the status bar
+     /// that offers to resolve conflicts using the agent.
+     ///
