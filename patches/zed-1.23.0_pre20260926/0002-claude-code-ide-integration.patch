@@ -1337,10 +1337,10 @@ index 0000000..31c4bfa
 +}
 diff --git a/crates/claude_code_ide/src/tools.rs b/crates/claude_code_ide/src/tools.rs
 new file mode 100644
-index 0000000..2978e1b
+index 0000000..25f28f3
 --- /dev/null
 +++ b/crates/claude_code_ide/src/tools.rs
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,592 @@
 +//! The GPUI-backed [`Dispatcher`] implementation: this is where the wire
 +//! protocol meets Zed's editor state. Each `tools/call` is satisfied by reading
 +//! the active workspace, editor, and buffers and shaping the result into the
@@ -1372,7 +1372,11 @@ index 0000000..2978e1b
 +        window: Option<AnyWindowHandle>,
 +        cx: AsyncApp,
 +    ) -> Self {
-+        Self { workspace, window, cx }
++        Self {
++            workspace,
++            window,
++            cx,
++        }
 +    }
 +
 +    fn get_current_selection(&self, cx: &mut AsyncApp) -> Result<Value, ProtocolError> {
@@ -1442,7 +1446,11 @@ index 0000000..2978e1b
 +        let folders = paths
 +            .iter()
 +            .map(|path| {
-+                let name = path.rsplit('/').next().filter(|name| !name.is_empty()).unwrap_or(path);
++                let name = path
++                    .rsplit('/')
++                    .next()
++                    .filter(|name| !name.is_empty())
++                    .unwrap_or(path);
 +                json!({ "name": name, "uri": format!("file://{path}"), "path": path })
 +            })
 +            .collect::<Vec<_>>();
@@ -1511,7 +1519,11 @@ index 0000000..2978e1b
 +        Ok(mcp_text(json!({ "tabs": tabs })))
 +    }
 +
-+    fn get_diagnostics(&self, arguments: &Value, cx: &mut AsyncApp) -> Result<Value, ProtocolError> {
++    fn get_diagnostics(
++        &self,
++        arguments: &Value,
++        cx: &mut AsyncApp,
++    ) -> Result<Value, ProtocolError> {
 +        let target = arguments
 +            .get("uri")
 +            .and_then(Value::as_str)
@@ -1622,8 +1634,9 @@ index 0000000..2978e1b
 +        let path = required_path_field(&arguments, "filePath")?;
 +        let start_line = arguments.get("startLine").and_then(Value::as_u64);
 +        let end_line = arguments.get("endLine").and_then(Value::as_u64);
-+        let window =
-+            self.window.ok_or_else(|| ProtocolError::internal("no window available"))?;
++        let window = self
++            .window
++            .ok_or_else(|| ProtocolError::internal("no window available"))?;
 +        let open_task = window
 +            .update(cx, |_root, window, cx| {
 +                self.workspace.upgrade().map(|workspace| {
@@ -1639,7 +1652,9 @@ index 0000000..2978e1b
 +            })
 +            .map_err(|error| ProtocolError::internal(error.to_string()))?
 +            .ok_or_else(|| ProtocolError::internal("workspace unavailable"))?;
-+        let item = open_task.await.map_err(|error| ProtocolError::internal(error.to_string()))?;
++        let item = open_task
++            .await
++            .map_err(|error| ProtocolError::internal(error.to_string()))?;
 +
 +        // Optionally select the requested line range (1-indexed in the protocol).
 +        if let (Some(start), Some(end)) = (start_line, end_line) {
@@ -1649,9 +1664,14 @@ index 0000000..2978e1b
 +                        editor.update(cx, |editor, cx| {
 +                            let start = Point::new(start.saturating_sub(1) as u32, 0);
 +                            let end = Point::new(end as u32, 0);
-+                            editor.change_selections(Default::default(), window, cx, |selections| {
-+                                selections.select_ranges([start..end]);
-+                            });
++                            editor.change_selections(
++                                Default::default(),
++                                window,
++                                cx,
++                                |selections| {
++                                    selections.select_ranges([start..end]);
++                                },
++                            );
 +                        });
 +                    }
 +                })
@@ -1686,7 +1706,9 @@ index 0000000..2978e1b
 +                    .update(cx, |project, cx| project.save_buffer(buffer, cx))
 +            })
 +            .map_err(|error| ProtocolError::internal(error.to_string()))?;
-+        save_task.await.map_err(|error| ProtocolError::internal(error.to_string()))?;
++        save_task
++            .await
++            .map_err(|error| ProtocolError::internal(error.to_string()))?;
 +        Ok(mcp_text(json!({ "success": true, "filePath": path })))
 +    }
 +}
@@ -1711,109 +1733,147 @@ index 0000000..2978e1b
 +    }
 +}
 +
++/// Every tool this server answers, as `tools/list` advertises it. A free function
++/// so a plain test can hold it against `DISPATCHED`: `close_tab` was dispatched
++/// and never advertised, and nothing noticed (parity report item 32).
++fn tool_descriptors() -> Vec<ToolDescriptor> {
++    let empty_object_schema = json!({
++        "type": "object",
++        "additionalProperties": false,
++        "$schema": "http://json-schema.org/draft-07/schema#",
++    });
++    vec![
++        ToolDescriptor {
++            name: "getCurrentSelection",
++            description: "Get the current text selection in the editor",
++            input_schema: empty_object_schema.clone(),
++        },
++        ToolDescriptor {
++            name: "getLatestSelection",
++            description: "Get the most recent text selection (even if not in the active editor)",
++            input_schema: empty_object_schema.clone(),
++        },
++        ToolDescriptor {
++            name: "getWorkspaceFolders",
++            description: "Get all workspace folders currently open in the IDE",
++            input_schema: empty_object_schema.clone(),
++        },
++        ToolDescriptor {
++            name: "getOpenEditors",
++            description: "Get list of currently open files",
++            input_schema: empty_object_schema.clone(),
++        },
++        ToolDescriptor {
++            name: "closeAllDiffTabs",
++            description: "Close all diff tabs in the editor",
++            input_schema: empty_object_schema,
++        },
++        // The VS Code extension registers `close_tab` with no description and a
++        // required `tab_name`; the CLI calls it after an `openDiff` resolves.
++        // The handler below closes this window's diff tabs whatever the name.
++        ToolDescriptor {
++            name: "close_tab",
++            description: "Close the diff tab opened by openDiff",
++            input_schema: json!({
++                "type": "object",
++                "additionalProperties": false,
++                "$schema": "http://json-schema.org/draft-07/schema#",
++                "properties": { "tab_name": { "type": "string" } },
++                "required": ["tab_name"],
++            }),
++        },
++        ToolDescriptor {
++            name: "getDiagnostics",
++            description: "Get language diagnostics (errors, warnings) from the editor",
++            input_schema: json!({
++                "type": "object",
++                "additionalProperties": false,
++                "$schema": "http://json-schema.org/draft-07/schema#",
++                "properties": {
++                    "uri": { "type": "string" },
++                },
++            }),
++        },
++        ToolDescriptor {
++            name: "checkDocumentDirty",
++            description: "Check if a document has unsaved changes (is dirty)",
++            input_schema: json!({
++                "type": "object",
++                "additionalProperties": false,
++                "$schema": "http://json-schema.org/draft-07/schema#",
++                "properties": { "filePath": { "type": "string" } },
++                "required": ["filePath"],
++            }),
++        },
++        ToolDescriptor {
++            name: "saveDocument",
++            description: "Save a document with unsaved changes",
++            input_schema: json!({
++                "type": "object",
++                "additionalProperties": false,
++                "$schema": "http://json-schema.org/draft-07/schema#",
++                "properties": { "filePath": { "type": "string" } },
++                "required": ["filePath"],
++            }),
++        },
++        ToolDescriptor {
++            name: "openFile",
++            description: "Open a file in the editor and optionally select a range of text",
++            input_schema: json!({
++                "type": "object",
++                "additionalProperties": false,
++                "$schema": "http://json-schema.org/draft-07/schema#",
++                "properties": {
++                    "filePath": { "type": "string" },
++                    "preview": { "type": "boolean" },
++                    "startLine": { "type": "integer" },
++                    "endLine": { "type": "integer" },
++                    "startText": { "type": "string" },
++                    "endText": { "type": "string" },
++                    "makeFrontmost": { "type": "boolean" },
++                },
++                "required": ["filePath"],
++            }),
++        },
++        ToolDescriptor {
++            name: "openDiff",
++            description: "Open a diff view comparing old file content with new file content",
++            input_schema: json!({
++                "type": "object",
++                "additionalProperties": false,
++                "$schema": "http://json-schema.org/draft-07/schema#",
++                "properties": {
++                    "old_file_path": { "type": "string" },
++                    "new_file_path": { "type": "string" },
++                    "new_file_contents": { "type": "string" },
++                    "tab_name": { "type": "string" },
++                },
++                "required": ["old_file_path", "new_file_path", "new_file_contents", "tab_name"],
++            }),
++        },
++    ]
++}
++
++/// The names `call_tool` dispatches. Kept beside it so a new arm and a missing
++/// descriptor cannot both land unseen: `every_dispatched_tool_is_advertised`.
++#[cfg(test)]
++const DISPATCHED: &[&str] = &[
++    "getCurrentSelection",
++    "getLatestSelection",
++    "getWorkspaceFolders",
++    "getOpenEditors",
++    "getDiagnostics",
++    "checkDocumentDirty",
++    "openFile",
++    "saveDocument",
++    "close_tab",
++    "closeAllDiffTabs",
++    "openDiff",
++];
++
 +impl Dispatcher for WorkspaceDispatcher {
 +    fn tools(&self) -> Vec<ToolDescriptor> {
-+        let empty_object_schema = json!({
-+            "type": "object",
-+            "additionalProperties": false,
-+            "$schema": "http://json-schema.org/draft-07/schema#",
-+        });
-+        vec![
-+            ToolDescriptor {
-+                name: "getCurrentSelection",
-+                description: "Get the current text selection in the editor",
-+                input_schema: empty_object_schema.clone(),
-+            },
-+            ToolDescriptor {
-+                name: "getLatestSelection",
-+                description: "Get the most recent text selection (even if not in the active editor)",
-+                input_schema: empty_object_schema.clone(),
-+            },
-+            ToolDescriptor {
-+                name: "getWorkspaceFolders",
-+                description: "Get all workspace folders currently open in the IDE",
-+                input_schema: empty_object_schema.clone(),
-+            },
-+            ToolDescriptor {
-+                name: "getOpenEditors",
-+                description: "Get list of currently open files",
-+                input_schema: empty_object_schema.clone(),
-+            },
-+            ToolDescriptor {
-+                name: "closeAllDiffTabs",
-+                description: "Close all diff tabs in the editor",
-+                input_schema: empty_object_schema,
-+            },
-+            ToolDescriptor {
-+                name: "getDiagnostics",
-+                description: "Get language diagnostics (errors, warnings) from the editor",
-+                input_schema: json!({
-+                    "type": "object",
-+                    "additionalProperties": false,
-+                    "$schema": "http://json-schema.org/draft-07/schema#",
-+                    "properties": {
-+                        "uri": { "type": "string" },
-+                    },
-+                }),
-+            },
-+            ToolDescriptor {
-+                name: "checkDocumentDirty",
-+                description: "Check if a document has unsaved changes (is dirty)",
-+                input_schema: json!({
-+                    "type": "object",
-+                    "additionalProperties": false,
-+                    "$schema": "http://json-schema.org/draft-07/schema#",
-+                    "properties": { "filePath": { "type": "string" } },
-+                    "required": ["filePath"],
-+                }),
-+            },
-+            ToolDescriptor {
-+                name: "saveDocument",
-+                description: "Save a document with unsaved changes",
-+                input_schema: json!({
-+                    "type": "object",
-+                    "additionalProperties": false,
-+                    "$schema": "http://json-schema.org/draft-07/schema#",
-+                    "properties": { "filePath": { "type": "string" } },
-+                    "required": ["filePath"],
-+                }),
-+            },
-+            ToolDescriptor {
-+                name: "openFile",
-+                description: "Open a file in the editor and optionally select a range of text",
-+                input_schema: json!({
-+                    "type": "object",
-+                    "additionalProperties": false,
-+                    "$schema": "http://json-schema.org/draft-07/schema#",
-+                    "properties": {
-+                        "filePath": { "type": "string" },
-+                        "preview": { "type": "boolean" },
-+                        "startLine": { "type": "integer" },
-+                        "endLine": { "type": "integer" },
-+                        "startText": { "type": "string" },
-+                        "endText": { "type": "string" },
-+                        "makeFrontmost": { "type": "boolean" },
-+                    },
-+                    "required": ["filePath"],
-+                }),
-+            },
-+            ToolDescriptor {
-+                name: "openDiff",
-+                description: "Open a diff view comparing old file content with new file content",
-+                input_schema: json!({
-+                    "type": "object",
-+                    "additionalProperties": false,
-+                    "$schema": "http://json-schema.org/draft-07/schema#",
-+                    "properties": {
-+                        "old_file_path": { "type": "string" },
-+                        "new_file_path": { "type": "string" },
-+                        "new_file_contents": { "type": "string" },
-+                        "tab_name": { "type": "string" },
-+                    },
-+                    "required": ["old_file_path", "new_file_path", "new_file_contents", "tab_name"],
-+                }),
-+            },
-+        ]
++        tool_descriptors()
 +    }
 +
 +    async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, ProtocolError> {
@@ -1851,6 +1911,27 @@ index 0000000..2978e1b
 +/// extensions do.
 +fn mcp_text(payload: Value) -> Value {
 +    json!({ "content": [{ "type": "text", "text": payload.to_string() }] })
++}
++
++#[cfg(test)]
++mod descriptor_tests {
++    use super::*;
++
++    #[test]
++    fn every_dispatched_tool_is_advertised() {
++        let advertised: Vec<&str> = tool_descriptors().iter().map(|tool| tool.name).collect();
++        for name in DISPATCHED {
++            assert!(
++                advertised.contains(name),
++                "`{name}` is dispatched but not advertised"
++            );
++        }
++        assert_eq!(
++            advertised.len(),
++            DISPATCHED.len(),
++            "an advertised tool is not dispatched"
++        );
++    }
 +}
 diff --git a/crates/project/src/project.rs b/crates/project/src/project.rs
 index ae264f3..0f03bf3 100644
