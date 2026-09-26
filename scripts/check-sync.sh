@@ -8,6 +8,7 @@
 #   1. series  <-> ebuild   the ebuild's PATCHES+=() list against the series
 #   2. patches <-> overlay  this repository's files against the overlay's files/
 #   3. patches <-> source   every patch still applies to the packaged tree
+#   4. patches, clean       no patch carries a *.orig or *.rej file
 #
 # 1 is the one no other script checks: sync-overlay.sh copies what the series
 # names and reports what the overlay has spare, but neither side reads the
@@ -147,6 +148,32 @@ check_source() {
 	printf '%s\n' "${out}" | sed 's/^/           /'
 }
 
+# check_litter <dir> — relation 4: no patch in the series adds a *.orig or *.rej.
+#
+# Those are what `patch` leaves beside a hunk it could not place cleanly, and a
+# refresh that regenerates a patch from a dirty tree writes them INTO the patch
+# as new files. The cause was fixed in refresh.sh (item 24 of the parity report);
+# this is the detector that was never built (item 40), so litter arriving by any
+# other route -- a hand-made diff, a `git add -A` in a scratch tree -- is no longer
+# silent. It applies cleanly, which is exactly why verify.sh cannot see it.
+check_litter() {
+	local dir="$1" patch hits=()
+	for patch in "${patches[@]}"; do
+		if grep -qE '^(\+\+\+ b/|diff --git a/).*\.(orig|rej)( |$)' "${dir}/${patch}"; then
+			hits+=("${patch}")
+		fi
+	done
+	if ((${#hits[@]} == 0)); then
+		report "ok" "patches, clean: no patch carries a *.orig or *.rej file"
+		return 0
+	fi
+	report "DRIFT" "patches, clean: *.orig / *.rej inside ${#hits[@]} patch(es)"
+	for patch in "${hits[@]}"; do
+		printf '           %s\n' "${patch}"
+		grep -E '^\+\+\+ b/.*\.(orig|rej)$' "${dir}/${patch}" | sed 's/^/             /'
+	done
+}
+
 main() {
 	local pf="" arg
 	for arg in "$@"; do
@@ -184,6 +211,7 @@ main() {
 	check_ebuild patches
 	check_overlay patches "${dir}"
 	check_source "${ZP_PV}"
+	check_litter "${dir}"
 
 	printf '\n'
 	if ((DRIFT == 0)); then
