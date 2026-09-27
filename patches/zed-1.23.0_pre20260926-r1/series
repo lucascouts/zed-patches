@@ -124,6 +124,14 @@
 # 0014 and 0026: the elicitation path is generic ACP and nothing here needs
 # the adapter -- but nothing else in practice sends a question-shaped form.
 0027-pinned-elicitation-card.patch
+# 0028: a folder dropped on the threads sidebar opens as a project of its own,
+# through the same MultiWorkspace::open_project the sidebar's "Add Project"
+# popover uses -- one project per folder, files ignored, and a folder that is
+# already a project in any window skipped rather than re-activated. The sidebar
+# accepted no drop before, so there is no old behaviour to keep behind a
+# setting. Pure Zed, BY CHOICE, the way 0014 and 0026 are: the threads sidebar
+# is agent UI, and nothing here needs the adapter.
+0028-sidebar-drop-folder-adds-project.patch
 
 # @feature: claude-code-ide
 0002-claude-code-ide-integration.patch
