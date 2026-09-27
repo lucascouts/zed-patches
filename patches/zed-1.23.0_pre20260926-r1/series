@@ -140,6 +140,13 @@
 # ambient tasks, and it arrives between turns, which is the whole point. Rides
 # this flag BY DEPENDENCY, like 0011 and 0013: no other agent sends that key.
 0029-background-task-status.patch
+# 0030: a thread whose agent asked a question and is waiting for the answer
+# gets its own sidebar status -- a Chat icon and "Waiting for Your Answer" --
+# instead of the running spinner the still-open turn produced. Reads the
+# Conversation's elicitation_requests map, which was kept up to date and read
+# by nothing; permissions keep their warning triangle and outrank it. Pure
+# Zed and generic ACP, so it rides this flag BY CHOICE, like 0027.
+0030-question-status.patch
 
 # @feature: claude-code-ide
 0002-claude-code-ide-integration.patch
