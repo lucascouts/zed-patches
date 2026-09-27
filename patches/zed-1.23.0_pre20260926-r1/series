@@ -120,7 +120,10 @@
 # options menu; unlike 0018 it defaults to the NEW behaviour, with upstream's
 # inline rendering one click away. Pagination is gated on the adapter's
 # un-namespaced _askUserQuestionCustomAnswer marker, so an MCP server's
-# ordinary form is never split. Rides this flag BY CHOICE, like 0010, 0012,
+# ordinary form is never split. Several question sets asked in one turn are
+# queued in that one card -- "Set 1 of 3", the next taking the card as each is
+# answered -- rather than stacked; permissions stay stacked. Rides this flag
+# BY CHOICE, like 0010, 0012,
 # 0014 and 0026: the elicitation path is generic ACP and nothing here needs
 # the adapter -- but nothing else in practice sends a question-shaped form.
 0027-pinned-elicitation-card.patch

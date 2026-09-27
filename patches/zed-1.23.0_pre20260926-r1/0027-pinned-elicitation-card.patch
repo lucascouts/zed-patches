@@ -73,6 +73,29 @@ Submission is unchanged: the accept button still sends one response with every
 field, so this is presentation only -- no protocol change, and nothing the
 adapter has to know about.
 
+Several question sets in one turn are queued, not stacked.
+
+The model can make more than one AskUserQuestion call in a single turn, and
+each arrives as a pending form of its own. Drawn side by side they grew a
+column above the composer that pushed the conversation off screen, while the
+turn still needed every one of them answered. The pinned slot now draws only
+the oldest pending form; the rest wait behind it and take the card as each
+one is answered or cancelled. Permission requests are untouched -- they stay
+stacked, one row each, which is right for a list of independent approvals.
+
+  * The header reads "Set 2 of 3" while more than one is queued. The count
+    runs over a burst -- from the first pending question until none is left --
+    held in a `QuestionQueue` on the view, because counting only what is
+    pending would read "1 of 3" and then "1 of 2": an answered set leaves the
+    list. It is advanced from `render`, as `sync_local_commands` already is,
+    because questions are added and resolved by the thread rather than by an
+    event this view owns.
+
+  * Each queued form keeps its own response. The calls are separate tool uses,
+    each waiting on its own answer, so merging them into one form would make
+    the adapter split the reply back apart. The queue changes what is drawn
+    and nothing that is sent.
+
 The two `AgentSettings` struct literals in test modules (`agent_ui`,
 `agent::tool_permissions`) gain the new field; they construct the struct
 exhaustively rather than from defaults.
@@ -294,7 +317,7 @@ index 0208c36..a146bdd 100644
          )
      }
 diff --git a/crates/agent_ui/src/conversation_view/elicitation.rs b/crates/agent_ui/src/conversation_view/elicitation.rs
-index 6b8c2d8..c6afdbd 100644
+index 6b8c2d8..be41aa9 100644
 --- a/crates/agent_ui/src/conversation_view/elicitation.rs
 +++ b/crates/agent_ui/src/conversation_view/elicitation.rs
 @@ -52,6 +52,13 @@ pub(crate) struct ElicitationFormState {
@@ -403,7 +426,7 @@ index 6b8c2d8..c6afdbd 100644
                      .render(cx),
                  )
          }
-@@ -1165,6 +1214,162 @@ mod tests {
+@@ -1165,6 +1214,203 @@ mod tests {
          });
      }
  
@@ -438,6 +461,47 @@ index 6b8c2d8..c6afdbd 100644
 +                false,
 +            )
 +            .property("question_1_custom", custom_answer_field("question_1"), false)
++    }
++
++    fn entry_ids<const N: usize>(ids: [&str; N]) -> [ElicitationEntryId; N] {
++        ids.map(|id| ElicitationEntryId(id.into()))
++    }
++
++    #[test]
++    fn question_queue_advances_instead_of_shrinking() {
++        let [first, second, third] = entry_ids(["first", "second", "third"]);
++        let mut queue = QuestionQueue::default();
++
++        assert_eq!(queue.advance(&[&first, &second, &third]), Some((1, 3)));
++        assert_eq!(
++            queue.advance(&[&second, &third]),
++            Some((2, 3)),
++            "an answered question still counts, or the total shrinks under the user"
++        );
++        assert_eq!(queue.advance(&[&third]), Some((3, 3)));
++    }
++
++    #[test]
++    fn question_queue_counts_a_late_question_into_the_same_burst() {
++        let [first, second, third] = entry_ids(["first", "second", "third"]);
++        let mut queue = QuestionQueue::default();
++
++        assert_eq!(queue.advance(&[&first, &second]), Some((1, 2)));
++        assert_eq!(queue.advance(&[&second, &third]), Some((2, 3)));
++    }
++
++    #[test]
++    fn question_queue_starts_over_once_it_runs_dry() {
++        let [first, second] = entry_ids(["first", "second"]);
++        let mut queue = QuestionQueue::default();
++
++        assert_eq!(queue.advance(&[&first]), Some((1, 1)));
++        assert_eq!(queue.advance(&[]), None);
++        assert_eq!(
++            queue.advance(&[&second]),
++            Some((1, 1)),
++            "a question asked after the queue emptied is not the second of the old burst"
++        );
 +    }
 +
 +    #[test]
@@ -566,7 +630,7 @@ index 6b8c2d8..c6afdbd 100644
      #[gpui::test]
      fn form_state_reports_all_validation_errors(cx: &mut TestAppContext) {
          crate::conversation_view::tests::init_test(cx);
-@@ -1698,6 +1903,100 @@ fn ask_user_question_option_preview(meta: Option<&acp::Meta>) -> Option<String>
+@@ -1698,6 +1944,100 @@ fn ask_user_question_option_preview(meta: Option<&acp::Meta>) -> Option<String>
          .map(|preview| preview.to_string())
  }
  
@@ -667,7 +731,7 @@ index 6b8c2d8..c6afdbd 100644
  /// Wrap an HTML-looking preview in a fenced code block so Markdown renders it as
  /// escaped plain text — the card never renders raw HTML.
  fn preview_markdown_source(preview: &str) -> String {
-@@ -2010,6 +2309,7 @@ type RespondHandler = Rc<dyn Fn(ElicitationEntryId, &mut Window, &mut App)>;
+@@ -2010,6 +2350,7 @@ type RespondHandler = Rc<dyn Fn(ElicitationEntryId, &mut Window, &mut App)>;
  type OpenUrlHandler = Rc<dyn Fn(ElicitationEntryId, String, &mut Window, &mut App)>;
  type BooleanHandler = Rc<dyn Fn(ElicitationEntryId, String, bool, &mut App)>;
  type SelectHandler = Rc<dyn Fn(ElicitationEntryId, String, String, &mut App)>;
@@ -675,7 +739,7 @@ index 6b8c2d8..c6afdbd 100644
  type MultiSelectHandler = Rc<dyn Fn(ElicitationEntryId, String, String, bool, &mut App)>;
  type TogglePreviewHandler = Rc<dyn Fn(ElicitationEntryId, String, String, String, &mut App)>;
  
-@@ -2024,6 +2324,7 @@ pub(crate) struct ElicitationCardHandlers {
+@@ -2024,6 +2365,7 @@ pub(crate) struct ElicitationCardHandlers {
      on_single_select_change: SelectHandler,
      on_multi_select_change: MultiSelectHandler,
      on_toggle_preview: TogglePreviewHandler,
@@ -683,7 +747,7 @@ index 6b8c2d8..c6afdbd 100644
  }
  
  impl ElicitationCardHandlers {
-@@ -2037,6 +2338,7 @@ impl ElicitationCardHandlers {
+@@ -2037,6 +2379,7 @@ impl ElicitationCardHandlers {
          on_single_select_change: impl Fn(ElicitationEntryId, String, String, &mut App) + 'static,
          on_multi_select_change: impl Fn(ElicitationEntryId, String, String, bool, &mut App) + 'static,
          on_toggle_preview: impl Fn(ElicitationEntryId, String, String, String, &mut App) + 'static,
@@ -691,7 +755,7 @@ index 6b8c2d8..c6afdbd 100644
      ) -> Self {
          Self {
              on_submit: Rc::new(on_submit),
-@@ -2048,6 +2350,7 @@ impl ElicitationCardHandlers {
+@@ -2048,6 +2391,7 @@ impl ElicitationCardHandlers {
              on_single_select_change: Rc::new(on_single_select_change),
              on_multi_select_change: Rc::new(on_multi_select_change),
              on_toggle_preview: Rc::new(on_toggle_preview),
@@ -699,7 +763,7 @@ index 6b8c2d8..c6afdbd 100644
          }
      }
  
-@@ -2062,6 +2365,7 @@ impl ElicitationCardHandlers {
+@@ -2062,6 +2406,7 @@ impl ElicitationCardHandlers {
              |_, _, _, _| {},
              |_, _, _, _, _| {},
              |_, _, _, _, _| {},
@@ -707,20 +771,64 @@ index 6b8c2d8..c6afdbd 100644
          )
      }
  }
-@@ -2133,6 +2437,7 @@ pub(crate) struct ElicitationCard<'a> {
+@@ -2127,12 +2472,42 @@ fn is_url_display_segment_boundary(character: char) -> bool {
+     matches!(character, '/' | '?' | '&' | '#')
+ }
+ 
++/// The pinned questions a thread is waiting on, counted across one burst of
++/// them: from the moment one is pending until none is.
++///
++/// Counting only what is pending would make the counter shrink instead of
++/// advance -- "1 of 3", then "1 of 2" -- because an answered question leaves
++/// the pending list. Remembering every question seen pending since the queue
++/// last ran dry is what lets the second one read "2 of 3".
++#[derive(Default)]
++pub(crate) struct QuestionQueue {
++    seen: HashSet<ElicitationEntryId>,
++}
++
++impl QuestionQueue {
++    /// Record the questions pending now, in arrival order, and return
++    /// `(position, total)` for the first of them -- the one the card shows.
++    /// `None` when nothing is pending, which also ends the burst, so the next
++    /// question starts a count of its own.
++    pub(crate) fn advance(&mut self, pending: &[&ElicitationEntryId]) -> Option<(usize, usize)> {
++        if pending.is_empty() {
++            self.seen.clear();
++            return None;
++        }
++        self.seen.extend(pending.iter().map(|id| (*id).clone()));
++        let total = self.seen.len();
++        Some((total.saturating_sub(pending.len()) + 1, total))
++    }
++}
++
+ pub(crate) struct ElicitationCard<'a> {
+     entry_ix: usize,
+     elicitation: &'a Elicitation,
      requester_name: SharedString,
      form_state: Option<&'a ElicitationFormState>,
      handlers: ElicitationCardHandlers,
 +    paginated: bool,
++    queue_position: Option<(usize, usize)>,
  }
  
  impl<'a> ElicitationCard<'a> {
-@@ -2149,7 +2454,37 @@ impl<'a> ElicitationCard<'a> {
+@@ -2149,9 +2524,48 @@ impl<'a> ElicitationCard<'a> {
              requester_name,
              form_state,
              handlers,
 +            paginated: false,
-+        }
++            queue_position: None,
+         }
+     }
+ 
++    /// `(position, total)` of this card among the questions queued behind one
++    /// another. Shown only when there is more than one: a lone question has
++    /// nothing to count.
++    pub(crate) fn queue_position(mut self, queue_position: Option<(usize, usize)>) -> Self {
++        self.queue_position = queue_position.filter(|(_, total)| *total > 1);
++        self
 +    }
 +
 +    /// Step through the form one question at a time instead of putting all of
@@ -745,15 +853,41 @@ index 6b8c2d8..c6afdbd 100644
 +            || !matches!(self.elicitation.status, ElicitationStatus::Pending { .. })
 +        {
 +            return None;
-         }
++        }
 +
 +        let state = self.form_state?;
 +        let pages = state.pages();
 +        (pages.len() > 1).then(|| (state.page(), pages))
-     }
- 
++    }
++
      pub(crate) fn render(self, cx: &App) -> Div {
-@@ -2240,6 +2575,10 @@ impl<'a> ElicitationCard<'a> {
+         let border_color = cx.theme().colors().border.opacity(0.8);
+         let header_background = cx
+@@ -2225,9 +2639,20 @@ impl<'a> ElicitationCard<'a> {
+                             ),
+                     )
+                     .child(
+-                        Label::new(status_label)
+-                            .size(LabelSize::Small)
+-                            .color(Color::Muted),
++                        h_flex()
++                            .gap_1p5()
++                            .when_some(self.queue_position, |this, (position, total)| {
++                                this.child(
++                                    Label::new(format!("Set {position} of {total}"))
++                                        .size(LabelSize::Small)
++                                        .color(Color::Muted),
++                                )
++                            })
++                            .child(
++                                Label::new(status_label)
++                                    .size(LabelSize::Small)
++                                    .color(Color::Muted),
++                            ),
+                     ),
+             )
+             .child(body)
+@@ -2240,6 +2665,10 @@ impl<'a> ElicitationCard<'a> {
          let Some(state) = self.form_state else {
              return Empty.into_any_element();
          };
@@ -764,7 +898,7 @@ index 6b8c2d8..c6afdbd 100644
  
          v_flex()
              .gap_2()
-@@ -2256,8 +2595,24 @@ impl<'a> ElicitationCard<'a> {
+@@ -2256,8 +2685,24 @@ impl<'a> ElicitationCard<'a> {
                      )
                  },
              )
@@ -789,7 +923,7 @@ index 6b8c2d8..c6afdbd 100644
                      let field = state.fields.get(field_name)?;
                      Some(self.render_field(
                          field_name,
-@@ -2752,10 +3107,22 @@ impl<'a> ElicitationCard<'a> {
+@@ -2752,10 +3197,22 @@ impl<'a> ElicitationCard<'a> {
          let is_accepted_url =
              open_url.is_some() && matches!(self.elicitation.status, ElicitationStatus::Accepted);
          let is_submitting = self.form_state.is_some_and(|state| state.is_submitting);
@@ -812,7 +946,7 @@ index 6b8c2d8..c6afdbd 100644
          } else {
              ("Submit", IconName::Check, Color::Success)
          };
-@@ -2765,7 +3132,10 @@ impl<'a> ElicitationCard<'a> {
+@@ -2765,7 +3222,10 @@ impl<'a> ElicitationCard<'a> {
          let on_decline = self.handlers.on_decline.clone();
          let on_cancel = self.handlers.on_cancel.clone();
          let on_dismiss_url = self.handlers.on_dismiss_url.clone();
@@ -823,7 +957,7 @@ index 6b8c2d8..c6afdbd 100644
          let decline_id = self.elicitation.id.clone();
          let cancel_id = self.elicitation.id.clone();
          let dismiss_id = self.elicitation.id.clone();
-@@ -2777,6 +3147,22 @@ impl<'a> ElicitationCard<'a> {
+@@ -2777,6 +3237,22 @@ impl<'a> ElicitationCard<'a> {
              .justify_end()
              .border_t_1()
              .border_color(border_color)
@@ -846,7 +980,7 @@ index 6b8c2d8..c6afdbd 100644
              .child(
                  Button::new(("elicitation-accept", self.entry_ix), accept_label)
                      .tab_index(0_isize)
-@@ -2793,6 +3179,8 @@ impl<'a> ElicitationCard<'a> {
+@@ -2793,6 +3269,8 @@ impl<'a> ElicitationCard<'a> {
                              if !is_accepted_url {
                                  on_submit(submit_id.clone(), window, cx);
                              }
@@ -856,7 +990,7 @@ index 6b8c2d8..c6afdbd 100644
                              on_submit(submit_id.clone(), window, cx);
                          }
 diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
-index c56e3fa..ab99c5d 100644
+index 2f4dd40..114d800 100644
 --- a/crates/agent_ui/src/conversation_view/thread_view.rs
 +++ b/crates/agent_ui/src/conversation_view/thread_view.rs
 @@ -41,7 +41,7 @@ use language_model::{
@@ -868,7 +1002,33 @@ index c56e3fa..ab99c5d 100644
  use ui::{
      ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
      SplitButtonStyle, Tab, ToggleState,
-@@ -6566,6 +6566,7 @@ impl ThreadView {
+@@ -50,7 +50,8 @@ use util::markdown::{source_position_from_fragment, split_local_url_fragment};
+ use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
+ 
+ use super::elicitation::{
+-    ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
++    ElicitationCard, ElicitationCardHandlers, ElicitationFormState, QuestionQueue,
++    should_render_elicitation,
+ };
+ use super::*;
+ 
+@@ -614,6 +615,7 @@ pub struct ThreadView {
+     pub resumed_without_history: bool,
+     pub(crate) permission_selections: HashMap<acp::ToolCallId, PermissionSelection>,
+     elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
++    question_queue: QuestionQueue,
+     pub _cancel_task: Option<Task<()>>,
+     _save_task: Option<Task<()>>,
+     _draft_resolve_task: Option<Task<()>>,
+@@ -1028,6 +1030,7 @@ impl ThreadView {
+             new_server_version_available: None,
+             permission_selections: HashMap::default(),
+             elicitation_form_states: HashMap::default(),
++            question_queue: QuestionQueue::default(),
+             _cancel_task: None,
+             _save_task: None,
+             _draft_resolve_task: None,
+@@ -6566,6 +6569,7 @@ impl ThreadView {
                  let thread = self.thread.read(cx);
                  if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
                      && should_render_elicitation(elicitation)
@@ -876,7 +1036,7 @@ index c56e3fa..ab99c5d 100644
                  {
                      let elicitation = self.render_elicitation(entry_ix, elicitation, window, cx);
  
-@@ -6806,10 +6807,22 @@ impl ThreadView {
+@@ -6806,10 +6810,22 @@ impl ThreadView {
                      .log_err();
                  }
              },
@@ -901,7 +1061,7 @@ index c56e3fa..ab99c5d 100644
                          cx.notify();
                      }
                  })
-@@ -7235,6 +7248,65 @@ impl ThreadView {
+@@ -7235,6 +7251,75 @@ impl ThreadView {
          self.message_editor.read(cx).set_local_commands(commands);
      }
  
@@ -933,41 +1093,51 @@ index c56e3fa..ab99c5d 100644
 +    /// rendered alongside them are keyed by an index into a different list.
 +    /// An id path of their own is what stops index 0 of one colliding with
 +    /// index 0 of the other.
-+    fn render_pinned_elicitations(&self, cx: &Context<Self>) -> Option<AnyElement> {
-+        let handlers = self.elicitation_card_handlers(cx);
-+        let cards = self
-+            .thread
-+            .read(cx)
++    ///
++    /// Only the oldest pending question is drawn, with its place in the queue;
++    /// the rest wait behind it and take the card as each one is answered.
++    /// Several AskUserQuestion calls in one turn arrive as several pending
++    /// forms, and stacking them grew a column above the composer that pushed
++    /// the conversation off screen -- while the turn still needs every one of
++    /// them answered, so nothing is gained by showing them all at once.
++    fn render_pinned_elicitations(&mut self, cx: &Context<Self>) -> Option<AnyElement> {
++        let thread = self.thread.read(cx);
++        let pending = thread
++            .elicitations()
++            .iter()
++            .filter(|elicitation| Self::renders_elicitation_as_card(elicitation, cx))
++            .map(|elicitation| &elicitation.id)
++            .collect::<Vec<_>>();
++        let queue_position = self.question_queue.advance(&pending);
++
++        let (ix, elicitation) = thread
 +            .elicitations()
 +            .iter()
 +            .enumerate()
-+            .filter(|(_, elicitation)| Self::renders_elicitation_as_card(elicitation, cx))
-+            .map(|(ix, elicitation)| {
-+                ElicitationCard::new(
-+                    ix,
-+                    elicitation,
-+                    self.agent_display_name.clone(),
-+                    self.elicitation_form_states.get(&elicitation.id),
-+                    handlers.clone(),
-+                )
-+                .paginated(true)
-+                .render(cx)
-+                .into_any_element()
-+            })
-+            .collect::<Vec<_>>();
++            .find(|(_, elicitation)| Self::renders_elicitation_as_card(elicitation, cx))?;
++        let card = ElicitationCard::new(
++            ix,
++            elicitation,
++            self.agent_display_name.clone(),
++            self.elicitation_form_states.get(&elicitation.id),
++            self.elicitation_card_handlers(cx),
++        )
++        .paginated(true)
++        .queue_position(queue_position)
++        .render(cx);
 +
-+        (!cards.is_empty()).then(|| {
++        Some(
 +            v_flex()
 +                .id("pinned-elicitations")
-+                .children(cards)
-+                .into_any_element()
-+        })
++                .child(card)
++                .into_any_element(),
++        )
 +    }
 +
      fn render_request_elicitations(&self, cx: &Context<Self>) -> Vec<AnyElement> {
          let server_view = self.server_view.clone();
          let handlers_view = server_view.clone();
-@@ -12875,6 +12947,7 @@ impl Render for ThreadView {
+@@ -12875,6 +12960,7 @@ impl Render for ThreadView {
                  |this, version| this.child(self.render_new_version_callout(&version, cx)),
              )
              .children(self.render_token_limit_callout(cx))
