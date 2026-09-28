@@ -990,7 +990,7 @@ index 6b8c2d8..be41aa9 100644
                              on_submit(submit_id.clone(), window, cx);
                          }
 diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
-index 434da62..6c2c608 100644
+index 3d5d702..a924c54 100644
 --- a/crates/agent_ui/src/conversation_view/thread_view.rs
 +++ b/crates/agent_ui/src/conversation_view/thread_view.rs
 @@ -41,7 +41,7 @@ use language_model::{
@@ -1061,7 +1061,7 @@ index 434da62..6c2c608 100644
                          cx.notify();
                      }
                  })
-@@ -7237,6 +7253,75 @@ impl ThreadView {
+@@ -7288,6 +7304,75 @@ impl ThreadView {
          self.message_editor.read(cx).set_local_commands(commands);
      }
  
@@ -1137,7 +1137,7 @@ index 434da62..6c2c608 100644
      fn render_request_elicitations(&self, cx: &Context<Self>) -> Vec<AnyElement> {
          let server_view = self.server_view.clone();
          let handlers_view = server_view.clone();
-@@ -12877,6 +12962,7 @@ impl Render for ThreadView {
+@@ -12928,6 +13013,7 @@ impl Render for ThreadView {
                  |this, version| this.child(self.render_new_version_callout(&version, cx)),
              )
              .children(self.render_token_limit_callout(cx))

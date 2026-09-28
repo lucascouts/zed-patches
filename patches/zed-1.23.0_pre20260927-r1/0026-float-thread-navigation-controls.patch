@@ -12,9 +12,9 @@ reach in exactly the situation that makes them worth having: a long thread,
 scrolled away from both of its ends.
 
 This moves all of them onto the conversation container as an absolutely
-positioned overlay -- copy, previous user message, top, bottom, in that
-order -- and makes the two that belong to a turn relative to the scroll
-position instead of to the thread's ends.
+positioned overlay -- copy, previous user message, next user message, top,
+bottom, in that order -- and makes the three that belong to a turn relative
+to the scroll position instead of to the thread's ends.
 
 The first version of this patch floated only the two navigation buttons and
 left copy inline, on the argument that a control floating over the whole
@@ -48,6 +48,28 @@ copy button of the last turn sat right behind the overlay, covered by it.
   which covers a thread with no user message at all. It is NOT disabled while
   generating: moving the viewport is harmless mid-turn and is when it is most
   wanted.
+
+- "Scroll to Next User Message" is new, and is the other half of that walk:
+  the first user message below the scroll top, measured the same way. The
+  message at the scroll top is never the answer -- just landed on or partly
+  scrolled past, it is the one being read. It lands with the same
+  `scroll_to_user_message_index`, so a back-then-forward pair returns to
+  exactly where it started.
+
+- It is disabled when there is nothing later to go to AND when the list's
+  end is already in view. The second case is the common one: at the end of a
+  thread whose last turn is short, the last user message is still on screen,
+  below the scroll top, and a scroll to it is clamped to where the viewport
+  already is -- a live button that moves nothing. "In view" is read off the
+  last item's `bounds_for_item`, not `ListState::is_scrolled_to_end`, which
+  answers `None` while any item is unmeasured; this list measures lazily, so
+  in a long thread that is nearly always. Net effect: the button lights up
+  only once the conversation has been scrolled up, which is when "next" has
+  a meaning.
+
+- Its icon, `UserArrowDown`, is new: `user_arrow_up.svg` with the arrow
+  reflected across its own vertical extent, the figure untouched, so the pair
+  reads as one control and aligns on the same baseline.
 
 - "Scroll to Bottom" is new, and is the existing `scroll_to_end`.
 
@@ -87,8 +109,20 @@ Pure Zed: nothing here needs the adapter, so like 0010, 0012 and 0014 it rides
 the claude-agent-acp-plus flag BY CHOICE rather than by dependency.
 ---
 
+diff --git a/assets/icons/user_arrow_down.svg b/assets/icons/user_arrow_down.svg
+new file mode 100644
+index 0000000..c47550f
+--- /dev/null
++++ b/assets/icons/user_arrow_down.svg
+@@ -0,0 +1,6 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M12.0295 9.44867V14.2214" stroke="#DCE0E5" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
++<path d="M14.4177 12.4129L12.0297 14.8008L9.64166 12.4129" stroke="#DCE0E5" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
++<path d="M1.66669 12.3688C1.66667 11.445 1.93321 10.5408 2.43433 9.76481C2.93545 8.98877 3.64985 8.37383 4.49181 7.99376C5.33376 7.61369 6.26751 7.48465 7.18099 7.62211C8.09447 7.75958 8.94888 8.15772 9.64169 8.76875" stroke="#DCE0E5" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
++<path d="M7.61473 7.34036C7.25075 7.49113 6.86064 7.56873 6.46668 7.56873C5.67103 7.56873 4.90796 7.25266 4.34535 6.69005C3.78275 6.12744 3.46667 5.36438 3.46667 4.56873C3.46667 3.77308 3.78275 3.01001 4.34535 2.44741C4.90796 1.8848 5.67103 1.56873 6.46668 1.56873C6.86064 1.56873 7.25075 1.64632 7.61473 1.79709C7.9787 1.94785 8.30942 2.16883 8.58799 2.44741C8.86657 2.72598 9.08755 3.0567 9.23831 3.42068C9.38908 3.78465 9.46667 4.17476 9.46667 4.56873C9.46667 4.96269 9.38908 5.3528 9.23831 5.71678C9.08755 6.08075 8.86657 6.41147 8.58799 6.69005C8.30942 6.96862 7.9787 7.1896 7.61473 7.34036Z" stroke="#DCE0E5" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
++</svg>
 diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
-index 2e8a082..434da62 100644
+index 2e8a082..3d5d702 100644
 --- a/crates/agent_ui/src/conversation_view/thread_view.rs
 +++ b/crates/agent_ui/src/conversation_view/thread_view.rs
 @@ -6659,24 +6659,10 @@ impl ThreadView {
@@ -238,7 +272,7 @@ index 2e8a082..434da62 100644
              .opacity(0.4)
              .hover(|s| s.opacity(1.))
              .when(
-@@ -7071,22 +7018,189 @@ impl ThreadView {
+@@ -7071,22 +7018,240 @@ impl ThreadView {
                          h_flex()
                              .px_1()
                              .gap_1()
@@ -269,15 +303,22 @@ index 2e8a082..434da62 100644
 +    /// precisely when these start being useful. Anchoring them on the
 +    /// conversation container keeps them reachable from anywhere in the thread.
 +    ///
-+    /// Two of them are relative to the scroll position rather than to the
++    /// Three of them are relative to the scroll position rather than to the
 +    /// thread's ends, which is what lets a fixed control say which turn it
-+    /// means: copy acts on the turn the overlay sits over, and the user-message
-+    /// button walks back one message per click.
++    /// means: copy acts on the turn the overlay sits over, and the two
++    /// user-message buttons walk one message back or forward per click.
 +    fn render_floating_thread_navigation(&self, cx: &Context<Self>) -> impl IntoElement {
 +        let entries = self.thread.read(cx).entries();
 +
 +        let previous_user_message =
 +            Self::previous_user_message_ix(entries, self.list_state.logical_scroll_top());
++
++        // With the list's end already in view, a scroll to any later message
++        // is clamped to where the viewport already is, so the click would
++        // move nothing.
++        let next_user_message = (!self.is_list_end_in_view())
++            .then(|| Self::next_user_message_ix(entries, self.list_state.logical_scroll_top()))
++            .flatten();
 +
 +        // A turn still being written is disabled rather than hidden: copying it
 +        // would hand over a partial response, and a button that comes and goes
@@ -340,6 +381,21 @@ index 2e8a082..434da62 100644
 +                        })),
 +                    )
 +                    .child(
++                        IconButton::new(
++                            "floating_scroll_to_next_user_message",
++                            IconName::UserArrowDown,
++                        )
++                        .icon_size(IconSize::Small)
++                        .icon_color(Color::Muted)
++                        .disabled(next_user_message.is_none())
++                        .tooltip(Tooltip::text("Scroll to Next User Message"))
++                        .on_click(cx.listener(move |this, _, _, cx| {
++                            if let Some(ix) = next_user_message {
++                                this.scroll_to_user_message_index(Some(ix), cx);
++                            }
++                        })),
++                    )
++                    .child(
 +                        IconButton::new("floating_scroll_to_top", IconName::ArrowUp)
 +                            .icon_size(IconSize::Small)
 +                            .icon_color(Color::Muted)
@@ -387,6 +443,35 @@ index 2e8a082..434da62 100644
 +        (0..scroll_top.item_ix.min(entries.len()))
 +            .rev()
 +            .find(|&ix| is_user_message(ix))
++    }
++
++    /// The user message the "next" control should land on: the first one
++    /// below the scroll top, measured the same way as the previous one.
++    ///
++    /// The entry at the scroll top is never the answer, whether it sits there
++    /// exactly (just landed on it) or is partly scrolled past: either way it is
++    /// the message being read, not the next one.
++    fn next_user_message_ix(entries: &[AgentThreadEntry], scroll_top: ListOffset) -> Option<usize> {
++        (scroll_top.item_ix + 1..entries.len())
++            .find(|&ix| matches!(entries.get(ix), Some(AgentThreadEntry::UserMessage(_))))
++    }
++
++    /// Whether the bottom of the list's last item is inside the viewport,
++    /// i.e. there is nothing left to scroll down to.
++    ///
++    /// Measured from the last item's bounds rather than with
++    /// `ListState::is_scrolled_to_end`, which answers `None` whenever any item
++    /// is still unmeasured -- the normal state of a long thread, since this list
++    /// measures lazily. An unrendered last item has no bounds and reads as "not
++    /// in view", which is the truth: it is below the viewport.
++    fn is_list_end_in_view(&self) -> bool {
++        let Some(last_ix) = self.list_state.item_count().checked_sub(1) else {
++            return true;
++        };
++        let viewport_bottom = self.list_state.viewport_bounds().bottom();
++        self.list_state
++            .bounds_for_item(last_ix)
++            .is_some_and(|bounds| bounds.bottom() <= viewport_bottom + px(1.))
 +    }
 +
 +    /// The entry the floating overlay sits over, i.e. the last one whose top
@@ -437,7 +522,7 @@ index 2e8a082..434da62 100644
      fn is_thread_feedback_enabled(&self, cx: &App) -> bool {
          util::maybe!({
              let project = self.thread.read(cx).project().read(cx);
-@@ -12420,9 +12534,11 @@ impl Render for ThreadView {
+@@ -12420,9 +12585,11 @@ impl Render for ThreadView {
              })
              .map(|this| {
                  if has_messages {
@@ -450,7 +535,7 @@ index 2e8a082..434da62 100644
                          .vertical_scrollbar_for(&list_state, window, cx)
                          .into_any()
                  } else {
-@@ -13038,6 +13154,67 @@ mod tests {
+@@ -13038,6 +13205,97 @@ mod tests {
          }
      }
  
@@ -489,6 +574,36 @@ index 2e8a082..434da62 100644
 +    }
 +
 +    #[gpui::test]
++    fn next_user_message_walks_forward_one_message_per_click(cx: &mut gpui::TestAppContext) {
++        cx.update(|cx| {
++            // [User 0, Agent 1, User 2, Agent 3]
++            let entries = conversation_entries(cx);
++            let at = |item_ix: usize, offset: f32| ListOffset {
++                item_ix,
++                offset_in_item: px(offset),
++            };
++
++            // Landed on the first message: the next click goes to the second.
++            assert_eq!(
++                ThreadView::next_user_message_ix(&entries, at(0, 0.)),
++                Some(2)
++            );
++            // Reading the first response: the next message is below it.
++            assert_eq!(
++                ThreadView::next_user_message_ix(&entries, at(1, 40.)),
++                Some(2)
++            );
++            // Partly scrolled past a user message: that one is being read, so
++            // it is skipped rather than returned to.
++            assert_eq!(ThreadView::next_user_message_ix(&entries, at(2, 10.)), None);
++            // Landed on the last message: nothing later, so the button disables.
++            assert_eq!(ThreadView::next_user_message_ix(&entries, at(2, 0.)), None);
++            assert_eq!(ThreadView::next_user_message_ix(&entries, at(3, 40.)), None);
++            assert_eq!(ThreadView::next_user_message_ix(&[], at(0, 0.)), None);
++        });
++    }
++
++    #[gpui::test]
 +    fn copy_targets_the_turn_under_the_overlay(cx: &mut gpui::TestAppContext) {
 +        cx.update(|cx| {
 +            // [User 0, Agent 1, User 2, Agent 3]
@@ -518,3 +633,15 @@ index 2e8a082..434da62 100644
      #[gpui::test]
      fn copy_yields_the_users_own_message(cx: &mut gpui::TestAppContext) {
          cx.update(|cx| {
+diff --git a/crates/icons/src/icons.rs b/crates/icons/src/icons.rs
+index 22ca64a..22ff8a6 100644
+--- a/crates/icons/src/icons.rs
++++ b/crates/icons/src/icons.rs
+@@ -287,6 +287,7 @@ pub enum IconName {
+     TriangleRight,
+     Undo,
+     Unpin,
++    UserArrowDown,
+     UserArrowUp,
+     UserCheck,
+     UserGroup,
