@@ -1,0 +1,55 @@
+From 40fe0d79305375bb831e4252ecbaba651631316c Mon Sep 17 00:00:00 2001
+From: zed-patches <zed-patches@localhost>
+Date: Sat, 12 Sep 2026 22:42:28 -0300
+Subject: [PATCH 20/22] zed: name the application binary zeo
+
+The installed executable is `zeo`, so that a machine carrying both editors has
+two commands rather than a collision. This is the packaging-visible half of the
+identity; the state directories are the other half, and neither alone is enough.
+
+Only the [[bin]] target and `default-run` change. The Cargo *package* stays
+`zed`, and so does every crate in the workspace - that boundary is deliberate and
+it is the reason this whole rebrand is five small patches instead of a fork:
+
+  - Renaming the package would rename `zed::` at ~159 sites and `zed_actions::`
+    at ~348, every one of them a line upstream also edits. Each snapshot bump
+    would then arrive as a conflict in files nobody meant to touch, in exchange
+    for a name no user ever sees.
+  - The WIT package `zed:extension` is untouchable for a harder reason: it is the
+    ABI every published Zed extension imports. Renaming it does not rebrand the
+    extension ecosystem, it locks Zeo out of it.
+
+The CLI keeps its cargo bin name `cli`, as upstream has it - a second bin named
+`zeo` would collide in target/. The CLI becomes the `zeo` *command* at install
+time, mirroring upstream's own cli -> zed relationship.
+
+Decision D9 in zeo/docs/REBRAND.md.
+---
+ crates/zed/Cargo.toml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/crates/zed/Cargo.toml b/crates/zed/Cargo.toml
+index d9562b6..5adc4d7 100644
+--- a/crates/zed/Cargo.toml
++++ b/crates/zed/Cargo.toml
+@@ -6,7 +6,7 @@ version = "1.21.0"
+ publish.workspace = true
+ license = "GPL-3.0-or-later"
+ authors = ["Zed Team <hi@zed.dev>"]
+-default-run = "zed"
++default-run = "zeo"
+ 
+ [lints]
+ workspace = true
+@@ -59,7 +59,7 @@ visual-tests = [
+ ]
+ 
+ [[bin]]
+-name = "zed"
++name = "zeo"
+ path = "src/main.rs"
+ 
+ [[bin]]
+-- 
+2.55.0
+
