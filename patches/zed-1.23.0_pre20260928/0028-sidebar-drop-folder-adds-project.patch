@@ -1,0 +1,262 @@
+From ec58769cd70cf4872873073f2f91807a535c125c Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@protonmail.com>
+Date: Sat, 26 Sep 2026 22:28:48 -0300
+Subject: [PATCH] Open a folder dropped on the threads sidebar as a project of
+ its own
+
+The threads sidebar lists one group per project and already has a way to add
+one -- the "Add Project" popover, which ends in MultiWorkspace::open_project.
+It accepted no drop at all: a folder dragged from a file manager onto the
+list fell through and nothing happened. This wires ExternalPaths onto the
+sidebar root and sends each dropped folder down that same open_project path,
+so a drop does exactly what picking the folder in the popover does, restored
+session included.
+
+Three decisions worth stating.
+
+One project per folder. Dropping three folders adds three groups, not one
+multi-root project. open_project given several paths would build the
+multi-root one; the loop calls it once per folder instead, sequentially, so
+the empty-workspace replacement open_project performs runs once and is not
+raced by the next folder.
+
+A folder that is already a project anywhere is skipped, not re-activated.
+open_project on its own would find an existing workspace in THIS window and
+activate it, which moves focus -- the wrong answer to a drop on a list -- and
+it looks at no other window, so a folder open elsewhere would be opened a
+second time here. is_open_as_project walks every MultiWorkspace window and
+matches both a listed group key (a group with no open workspace still counts)
+and an open workspace rooted at exactly that folder. It runs right before each
+open, not once up front, so the same folder dropped twice opens once. A folder
+nested inside an open project is not that project and still opens.
+
+Files are skipped. Unlike 0018's editor-area drop, where a file has an obvious
+meaning, a file dropped on a list of projects has none, so this needs no
+setting: dropping a folder on the sidebar had no behaviour before, and the one
+it gains is the only reading the gesture has.
+
+The drag highlight is drop_target_background blended over the sidebar's own
+background, not set in its place. That theme colour is translucent -- it is
+meant to sit on top of something, the way pane.rs paints it on an overlay
+div -- and as the sidebar's own bg it replaced the opaque fill, so the window
+behind showed through for as long as the drag lasted.
+
+"Another instance" means another window of this process. Zed is
+single-instance per release channel -- a second launch hands its paths to the
+first over a socket -- so every window a user sees is reachable from
+cx.windows(). A Zeo process or a ZED_STATELESS one is a separate process with
+its own database, and is not consulted.
+
+The drop test covers the cross-window case on purpose: removing the
+is_open_as_project check still passes a same-window-only test, because
+open_project dedupes within its own window. Measured by mutation both ways.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/crates/sidebar/src/sidebar.rs b/crates/sidebar/src/sidebar.rs
+index 890248d..2287857 100644
+--- a/crates/sidebar/src/sidebar.rs
++++ b/crates/sidebar/src/sidebar.rs
+@@ -29,9 +29,9 @@ use feature_flags::{
+ };
+ use gpui::{
+     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
+-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
+-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
+-    linear_gradient, list, prelude::*, px,
++    ExternalPaths, FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render,
++    SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
++    linear_color_stop, linear_gradient, list, prelude::*, px,
+ };
+ use itertools::Itertools;
+ use language_model::LanguageModelRegistry;
+@@ -562,6 +562,26 @@ fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
+     PathList::new(&workspace.read(cx).root_paths(cx))
+ }
+ 
++/// Whether `folder` is already a local project in any window — a group listed
++/// in a sidebar, or an open workspace rooted at exactly that folder.
++fn is_open_as_project(folder: &Path, cx: &App) -> bool {
++    let path_list = PathList::new(&[folder]);
++    cx.windows()
++        .into_iter()
++        .filter_map(|window| window.downcast::<MultiWorkspace>())
++        .any(|window| {
++            window.read(cx).is_ok_and(|multi_workspace| {
++                multi_workspace
++                    .project_group_keys()
++                    .iter()
++                    .any(|key| key.host().is_none() && *key.path_list() == path_list)
++                    || multi_workspace
++                        .workspace_for_paths(&path_list, None, cx)
++                        .is_some()
++            })
++        })
++}
++
+ fn linked_worktree_path_lists_for_workspaces(
+     workspaces: &[Entity<Workspace>],
+     cx: &App,
+@@ -1295,6 +1315,44 @@ impl Sidebar {
+         }
+     }
+ 
++    /// Opens every folder dropped on the sidebar as a project of its own.
++    ///
++    /// Files are skipped, and so is a folder that is already a project here or
++    /// in another window. The check runs right before each open rather than
++    /// once up front, so the same folder dropped twice is opened once.
++    fn handle_external_paths_drop(
++        &mut self,
++        paths: &ExternalPaths,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
++            return;
++        };
++        let dropped = paths.paths().to_vec();
++        let fs = <dyn fs::Fs>::global(cx);
++
++        cx.spawn(async move |_this, cx| {
++            for path in dropped {
++                if !fs.is_dir(&path).await {
++                    continue;
++                }
++                if cx.update(|cx| is_open_as_project(&path, cx)) {
++                    log::info!("sidebar drop skipped: already open as a project path={path:?}");
++                    continue;
++                }
++                let open = window_handle.update(cx, |multi_workspace, window, cx| {
++                    multi_workspace.open_project(vec![path.clone()], OpenMode::Activate, window, cx)
++                })?;
++                if let Err(error) = open.await {
++                    log::error!("sidebar drop failed to open project path={path:?}: {error:#}");
++                }
++            }
++            anyhow::Ok(())
++        })
++        .detach_and_log_err(cx);
++    }
++
+     /// Opens a new workspace for a group that has no open workspaces.
+     fn open_workspace_for_group(
+         &mut self,
+@@ -7945,6 +8003,9 @@ impl Render for Sidebar {
+ 
+         let color = cx.theme().colors();
+         let bg = color.surface_background;
++        // drop_target_background is translucent: blended over the sidebar's
++        // own background, not in place of it, or the window shows through.
++        let drop_bg = bg.blend(color.drop_target_background);
+ 
+         let no_open_projects = !self.contents.has_open_projects;
+         let no_search_results = self.contents.entries.is_empty();
+@@ -7981,6 +8042,8 @@ impl Render for Sidebar {
+                 this.recent_projects_popover_handle.toggle(window, cx);
+             }))
+             .font(ui_font)
++            .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
++            .on_drop(cx.listener(Self::handle_external_paths_drop))
+             .map(|el| {
+                 let on_left = self.side(cx) == SidebarSide::Left;
+                 match window.window_decorations() {
+diff --git a/crates/sidebar/src/sidebar_tests.rs b/crates/sidebar/src/sidebar_tests.rs
+index d6ae15c..a235b37 100644
+--- a/crates/sidebar/src/sidebar_tests.rs
++++ b/crates/sidebar/src/sidebar_tests.rs
+@@ -15878,3 +15878,93 @@ fn sidebar_painted_background_at(position: Point<Pixels>, cx: &mut VisualTestCon
+         u32::from(Rgba::from(color))
+     })
+ }
++
++#[gpui::test]
++async fn test_is_open_as_project_looks_at_every_window(cx: &mut TestAppContext) {
++    init_test(cx);
++    let fs = FakeFs::new(cx.executor());
++    for folder in ["/open-here", "/open-elsewhere", "/listed-only", "/not-open"] {
++        fs.insert_tree(folder, serde_json::json!({ "src": {} }))
++            .await;
++    }
++    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
++
++    let here = project::Project::test(fs.clone(), [Path::new("/open-here")], cx).await;
++    let elsewhere = project::Project::test(fs.clone(), [Path::new("/open-elsewhere")], cx).await;
++    cx.add_window(|window, cx| MultiWorkspace::test_new(here, window, cx));
++    let other_window = cx.add_window(|window, cx| MultiWorkspace::test_new(elsewhere, window, cx));
++    // A group the sidebar lists without any workspace open for it.
++    other_window
++        .update(cx, |mw, _window, _cx| {
++            mw.test_add_project_group(workspace::ProjectGroup {
++                key: ProjectGroupKey::new(None, PathList::new(&[Path::new("/listed-only")])),
++                workspaces: Vec::new(),
++                expanded: true,
++            });
++        })
++        .unwrap();
++    cx.run_until_parked();
++
++    cx.update(|cx| {
++        assert!(is_open_as_project(Path::new("/open-here"), cx));
++        assert!(is_open_as_project(Path::new("/open-elsewhere"), cx));
++        assert!(is_open_as_project(Path::new("/listed-only"), cx));
++        assert!(!is_open_as_project(Path::new("/not-open"), cx));
++        // A folder nested in an open project is a project of its own.
++        assert!(!is_open_as_project(Path::new("/open-here/src"), cx));
++    });
++}
++
++#[gpui::test]
++async fn test_dropped_folders_open_as_projects(cx: &mut TestAppContext) {
++    init_test(cx);
++    let fs = FakeFs::new(cx.executor());
++    fs.insert_tree("/current", serde_json::json!({ "src": {} }))
++        .await;
++    fs.insert_tree("/new-one", serde_json::json!({ "src": {} }))
++        .await;
++    fs.insert_tree("/new-two", serde_json::json!({ "notes.md": "" }))
++        .await;
++    fs.insert_tree("/other-window", serde_json::json!({ "src": {} }))
++        .await;
++    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
++
++    let other = project::Project::test(fs.clone(), [Path::new("/other-window")], cx).await;
++    cx.add_window(|window, cx| MultiWorkspace::test_new(other, window, cx));
++    let project = project::Project::test(fs.clone(), [Path::new("/current")], cx).await;
++    let (multi_workspace, cx) =
++        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
++    let sidebar = setup_sidebar(&multi_workspace, cx);
++
++    let dropped = ExternalPaths(
++        vec![
++            PathBuf::from("/current"),
++            PathBuf::from("/other-window"),
++            PathBuf::from("/new-one"),
++            PathBuf::from("/new-two/notes.md"),
++            PathBuf::from("/new-two"),
++            PathBuf::from("/new-one"),
++        ]
++        .into(),
++    );
++    sidebar.update_in(cx, |sidebar, window, cx| {
++        sidebar.handle_external_paths_drop(&dropped, window, cx);
++    });
++    cx.run_until_parked();
++
++    let mut groups = multi_workspace.read_with(cx, |mw, _cx| {
++        mw.project_group_keys()
++            .into_iter()
++            .map(|key| key.path_list().paths().to_vec())
++            .collect::<Vec<_>>()
++    });
++    groups.sort();
++    assert_eq!(
++        groups,
++        vec![
++            vec![PathBuf::from("/current")],
++            vec![PathBuf::from("/new-one")],
++            vec![PathBuf::from("/new-two")],
++        ]
++    );
++}
