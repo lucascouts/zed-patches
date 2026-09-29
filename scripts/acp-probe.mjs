@@ -6,6 +6,7 @@
 //     acp-probe.mjs plan <adapter> [--cwd DIR] [--from MODE] [args...]
 //     acp-probe.mjs fallback <adapter> [--notices] [args...]
 //     acp-probe.mjs load <adapter> --session ID --cwd DIR [args...]
+//     acp-probe.mjs ask <adapter> [--cwd DIR] [args...]
 //
 // <adapter> is an executable (/usr/bin/claude-agent-acp-plus) or a .js entry
 // point (dist/index.js), which is run with this node.
@@ -26,6 +27,9 @@
 //   load  session/load an existing session and count what the replay sends:
 //         user and agent message chunks, and the first user text. Loading
 //         APPENDS to the transcript, so point it at a copy. No model turn.
+//   ask   advertise form elicitation, have the model ask a multi-select
+//         AskUserQuestion, answer it by ticking two options AND typing a note,
+//         and print what the model says it received. ONE REAL MODEL TURN.
 //
 // Why it is versioned: every parity round from the 2026-09-11 one on wrote this
 // probe fresh into /tmp (acp-probe2..6, acp-probe-plan) and lost it with the
@@ -37,9 +41,9 @@ import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 
 const [mode, adapter, ...rest] = process.argv.slice(2);
-if (!["init", "plan", "fallback", "load"].includes(mode) || !adapter) {
+if (!["init", "plan", "fallback", "load", "ask"].includes(mode) || !adapter) {
   console.error(
-    "usage: acp-probe.mjs init|plan|fallback|load <adapter> [--cwd DIR] [--from MODE] [--notices] [--session ID] [args...]",
+    "usage: acp-probe.mjs init|plan|fallback|load|ask <adapter> [--cwd DIR] [--from MODE] [--notices] [--session ID] [args...]",
   );
   process.exit(2);
 }
@@ -85,6 +89,7 @@ const finish = (code) => {
 };
 
 const replay = { user: 0, agent: 0, firstUser: undefined };
+let answerText = "";
 let buffer = "";
 child.stdout.on("data", (chunk) => {
   buffer += chunk;
@@ -105,6 +110,8 @@ child.stdout.on("data", (chunk) => {
         replay.firstUser ??= u.content?.text?.slice(0, 60);
       } else if (u.sessionUpdate === "agent_message_chunk" && mode === "load")
         replay.agent++;
+      else if (u.sessionUpdate === "agent_message_chunk" && mode === "ask")
+        answerText += u.content?.text ?? "";
       else if (u.sessionUpdate === "current_mode_update")
         log("MODE", { mode: u.currentModeId });
       else if (u.sessionUpdate === "config_option_update")
@@ -137,6 +144,18 @@ child.stdout.on("data", (chunk) => {
         id: msg.id,
         result: { outcome: { outcome: "selected", optionId: pick.optionId } },
       });
+    } else if (msg.method === "elicitation/create" && mode === "ask") {
+      // Tick the first two options of the first question AND type a note: the
+      // combination the adapter used to collapse to the note alone.
+      const props = msg.params.requestedSchema?.properties ?? {};
+      const key = Object.keys(props).find((k) => !k.endsWith("_custom"));
+      const options = (props[key]?.items?.anyOf ?? []).map((o) => o.const);
+      const content = {
+        [key]: options.slice(0, 2),
+        [`${key}_custom`]: "and also teal",
+      };
+      log("ELICIT", { fields: Object.keys(props), answering: content });
+      send({ id: msg.id, result: { action: "accept", content } });
     } else if (msg.id !== undefined && msg.method) {
       // fs/terminal requests: this probe offers none of them.
       send({
@@ -160,6 +179,7 @@ try {
       terminal: true,
       _meta: { terminal_output: true, "terminal-auth": true },
       ...(opts.notices ? { session: { notices: {} } } : {}),
+      ...(mode === "ask" ? { elicitation: { form: {} } } : {}),
     },
   });
   if (mode === "init") {
@@ -205,6 +225,25 @@ try {
       });
       await new Promise((r) => setTimeout(r, 300));
     }
+    finish(0);
+  }
+  if (mode === "ask") {
+    const asked = await request("session/prompt", {
+      sessionId: session.sessionId,
+      prompt: [
+        {
+          type: "text",
+          text:
+            "Use the AskUserQuestion tool once, with multiSelect true, to ask which colors I like, " +
+            "offering exactly: red, green, blue. Then reply with one line quoting exactly the " +
+            "answer the tool returned to you, and nothing else.",
+        },
+      ],
+    });
+    log("ANSWER", {
+      stopReason: asked.stopReason,
+      text: answerText.trim().slice(0, 300),
+    });
     finish(0);
   }
   for (const modeId of [opts.from, "plan"].filter(Boolean)) {
