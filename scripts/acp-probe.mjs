@@ -5,6 +5,7 @@
 //     acp-probe.mjs init <adapter> [args...]
 //     acp-probe.mjs plan <adapter> [--cwd DIR] [--from MODE] [args...]
 //     acp-probe.mjs fallback <adapter> [--notices] [args...]
+//     acp-probe.mjs load <adapter> --session ID --cwd DIR [args...]
 //
 // <adapter> is an executable (/usr/bin/claude-agent-acp-plus) or a .js entry
 // point (dist/index.js), which is run with this node.
@@ -22,6 +23,9 @@
 //         the adapter fall back and warn -- as a `notice` when the client
 //         advertised `session.notices` (--notices), as a transcript line
 //         otherwise. No model turn, no cost.
+//   load  session/load an existing session and count what the replay sends:
+//         user and agent message chunks, and the first user text. Loading
+//         APPENDS to the transcript, so point it at a copy. No model turn.
 //
 // Why it is versioned: every parity round from the 2026-09-11 one on wrote this
 // probe fresh into /tmp (acp-probe2..6, acp-probe-plan) and lost it with the
@@ -33,18 +37,25 @@ import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 
 const [mode, adapter, ...rest] = process.argv.slice(2);
-if (!["init", "plan", "fallback"].includes(mode) || !adapter) {
+if (!["init", "plan", "fallback", "load"].includes(mode) || !adapter) {
   console.error(
-    "usage: acp-probe.mjs init|plan|fallback <adapter> [--cwd DIR] [--from MODE] [--notices] [args...]",
+    "usage: acp-probe.mjs init|plan|fallback|load <adapter> [--cwd DIR] [--from MODE] [--notices] [--session ID] [args...]",
   );
   process.exit(2);
 }
 
-const opts = { cwd: process.cwd(), from: undefined, notices: false, args: [] };
+const opts = {
+  cwd: process.cwd(),
+  from: undefined,
+  notices: false,
+  session: undefined,
+  args: [],
+};
 for (let i = 0; i < rest.length; i++) {
   if (rest[i] === "--cwd") opts.cwd = rest[++i];
   else if (rest[i] === "--from") opts.from = rest[++i];
   else if (rest[i] === "--notices") opts.notices = true;
+  else if (rest[i] === "--session") opts.session = rest[++i];
   else opts.args.push(rest[i]);
 }
 mkdirSync(opts.cwd, { recursive: true });
@@ -73,6 +84,7 @@ const finish = (code) => {
   process.exit(code);
 };
 
+const replay = { user: 0, agent: 0, firstUser: undefined };
 let buffer = "";
 child.stdout.on("data", (chunk) => {
   buffer += chunk;
@@ -88,7 +100,12 @@ child.stdout.on("data", (chunk) => {
       msg.error ? waiter.reject(msg.error) : waiter.resolve(msg.result);
     } else if (msg.method === "session/update") {
       const u = msg.params.update;
-      if (u.sessionUpdate === "current_mode_update")
+      if (u.sessionUpdate === "user_message_chunk") {
+        replay.user++;
+        replay.firstUser ??= u.content?.text?.slice(0, 60);
+      } else if (u.sessionUpdate === "agent_message_chunk" && mode === "load")
+        replay.agent++;
+      else if (u.sessionUpdate === "current_mode_update")
         log("MODE", { mode: u.currentModeId });
       else if (u.sessionUpdate === "config_option_update")
         log("CONFIG", {
@@ -150,6 +167,15 @@ try {
     finish(0);
   }
 
+  if (mode === "load") {
+    await request("session/load", {
+      sessionId: opts.session,
+      cwd: opts.cwd,
+      mcpServers: [],
+    });
+    log("REPLAY", replay);
+    finish(0);
+  }
   const session = await request("session/new", {
     cwd: opts.cwd,
     mcpServers: [],
