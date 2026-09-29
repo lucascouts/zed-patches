@@ -15,11 +15,13 @@
 # adding a second knob.
 0018-drop-folder-opens-project.patch
 
-# 0024: zed://agent?session=<id> reopens an existing thread. The URL handler
-# accepted only ?prompt=, so a link could start a conversation and never return
-# to one, while AgentPanel::open_thread already took a session id and resolved
-# it through ThreadMetadataStore -- its own comment says share links enter that
-# way. Three lines of plumbing between two halves that were already here.
+# 0024: zed://agent?session=<id>[&cwd=<dir>] reopens an existing thread. The
+# URL handler accepted only ?prompt=, so a link could start a conversation and
+# never return to one. The thread opens the way a sidebar click opens it: the
+# agent and folders come off its metadata row, and the window is the one
+# holding that project, found across every window -- not the focused one, and
+# not AgentPanel::open_thread, which resolves every id to the native agent and
+# failed with "no thread found" for the adapter's sessions.
 # UNGROUPED like 0018: it needs no adapter and changes no default, so no USE
 # flag gates it. Numbered 0024 because 0019-0023 are the zeo rebrand patches,
 # which share this directory and this number space.

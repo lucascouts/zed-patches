@@ -45,10 +45,10 @@ discoverability this is for.
 ---
 
 diff --git a/crates/agent_ui/src/agent_panel.rs b/crates/agent_ui/src/agent_panel.rs
-index d6f0229..0d45676 100644
+index 0859426..0142266 100644
 --- a/crates/agent_ui/src/agent_panel.rs
 +++ b/crates/agent_ui/src/agent_panel.rs
-@@ -5781,9 +5781,14 @@ impl AgentPanel {
+@@ -5814,9 +5814,14 @@ impl AgentPanel {
                                  .action("Profiles", Box::new(ManageProfiles::default()));
                          }
  
