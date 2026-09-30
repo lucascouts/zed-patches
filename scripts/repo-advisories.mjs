@@ -150,8 +150,24 @@ for (const rel of dirs) {
     for (const advisory of advisories) {
       for (const vuln of advisory.vulnerabilities ?? []) {
         if (vuln.package?.ecosystem !== "npm" || vuln.package?.name !== pkg.name) continue;
-        if (!vuln.vulnerable_version_range || !inRange(pkg.version, vuln.vulnerable_version_range))
-          continue;
+        if (!vuln.vulnerable_version_range) continue;
+        // A bare version with a fix named elsewhere is a malformed range, not an
+        // exact match: @agentclientprotocol/sdk's GHSA-6q4g-4xp9-ch96 publishes
+        // "0.27.0" with patched_versions "1.5.1", and reading it as "= 0.27.0"
+        // hid 1.5.0 on 2026-09-29. Read it as "from there up to the newest fix":
+        // open-ended alone would also flag 1.5.0 under GHSA-p29f-jffj-96g8, whose
+        // bare "0.27.0" is fixed in 0.27.1, a line isPatched does not compare.
+        const newestFix = (vuln.patched_versions ?? "")
+          .split(",")
+          .map((p) => p.trim())
+          .filter(Boolean)
+          .sort(compare)
+          .at(-1);
+        const range =
+          newestFix && /^\s*[\d.]+\s*$/.test(vuln.vulnerable_version_range)
+            ? `>= ${vuln.vulnerable_version_range.trim()}, < ${newestFix}`
+            : vuln.vulnerable_version_range;
+        if (!inRange(pkg.version, range)) continue;
         if (isPatched(pkg.version, vuln.patched_versions)) continue;
         findings.push(
           `${pkg.name} ${pkg.version} — ${advisory.ghsa_id} (${advisory.severity}), ` +
