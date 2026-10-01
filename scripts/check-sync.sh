@@ -15,7 +15,7 @@
 # ebuild, so a patch the ebuild stopped applying stays in both and looks fine.
 #
 # With no <PF>, the version is taken from the overlay when it holds exactly one
-# zed ebuild — the common case, and unambiguous when it holds.
+# series-carrying ebuild — the common case, and unambiguous when it holds.
 #
 # Exit: 0 everything agrees · 1 a relation drifted · 2 environment problem.
 
@@ -37,12 +37,12 @@ report() {
 	[[ "${verdict}" == "ok" ]] || DRIFT=1
 }
 
-# _sole_pf — the PF of the only zed ebuild in the overlay, or a refusal naming
+# _sole_pf — the PF of the only series-carrying ebuild in the overlay, or a refusal naming
 # the candidates. Guessing between two ebuilds would pick a version the caller
 # did not mean, and a check that silently checks the wrong thing is worse than
 # no check.
 _sole_pf() {
-	local dir="${ZP_OVERLAY}/app-editors/zed"
+	local dir="${ZP_OVERLAY}/${ZP_CATEGORY_PATH}"
 	local -a found=()
 	local f
 	for f in "${dir}"/*.ebuild; do
@@ -50,8 +50,8 @@ _sole_pf() {
 		f="${f##*/}"
 		found+=("${f%.ebuild}")
 	done
-	((${#found[@]} > 0)) || die 2 "no zed ebuild in ${dir}"
-	((${#found[@]} == 1)) || die 2 "more than one zed ebuild — name one: ${found[*]}"
+	((${#found[@]} > 0)) || die 2 "no ebuild in ${dir}"
+	((${#found[@]} == 1)) || die 2 "more than one ebuild — name one: ${found[*]}"
 	printf '%s' "${found[0]}"
 }
 
@@ -92,7 +92,7 @@ check_ebuild() {
 check_overlay() {
 	local -n _series_ref2="$1"
 	local dir="$2"
-	local files="${ZP_OVERLAY}/app-editors/zed/files"
+	local files="${ZP_OVERLAY}/${ZP_CATEGORY_PATH}/files"
 	[[ -d "${files}" ]] || {
 		report "DRIFT" "patches <-> overlay: no files/ directory at ${files}"
 		return 0

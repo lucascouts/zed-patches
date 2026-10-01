@@ -1,12 +1,18 @@
 # zed-patches
 
 Source of truth for the downstream patches the `bentoo` overlay applies to
-`app-editors/zed`, plus the tooling that answers one question mechanically:
+`app-editors/zeo`, plus the tooling that answers one question mechanically:
 
 > **Do the patches still apply to the packaged source?**
 
 Before this repository the patches lived only in `app-editors/zed/files/`, and the
 only way to validate a version bump was to start a compile and watch it fail.
+
+**The series moved from `app-editors/zed` to `app-editors/zeo` on 2026-10-01.** Since
+then `zed` builds upstream's tagged releases with no patches, and the snapshot plus
+this series ships as Zeo — rebranded, versioned on its own (`0.1.0_p<date>`), and
+also prebuilt as `zeo-bin`. Directories under `patches/` named `zed-*` are the history
+from before the move; new ones are named after the Zeo `PF`.
 
 ## What this repository owns
 
@@ -49,11 +55,13 @@ isolation — the default run applies **every** patch, which is the strictest ca
 | Command | Purpose |
 |---|---|
 | `scripts/bump.sh [--from <PF>] [--to <PF>] [--apply]` | carry the series onto the version the overlay now packages: refresh, verify, sync, check — stopping at the ebuild |
-| `scripts/prepare-tree.sh <PF> [--force]` | extract `${DISTDIR}/<PF>.tar.gz` into `work/zed-<commit>/` and give it a baseline commit |
+| `scripts/prepare-tree.sh <PF> [--force]` | extract the Zed distfile the ebuild's `SRC_URI` names (`zed-<commit>.tar.gz` for zeo) into `work/zed-<commit>/` and give it a baseline commit |
 | `scripts/verify.sh <PF> [--feature=<flag>]` | apply the whole series cumulatively, in a throwaway worktree cut from the prepared tree's baseline -- never in the tree itself |
 | `scripts/sync-overlay.sh <PF> [--dry-run]` | copy the verified series into the overlay's `files/`, reporting orphans |
 | `scripts/refresh.sh --from <PF_old> --to <PF_new>` | carry the series onto a new packaged commit, regenerating each patch |
 | `scripts/check-sync.sh [<PF>]` | verify the series against the ebuild, the overlay and the packaged source, in one pass |
+| `scripts/release-zeo-bin.sh <PF> [--fresh]` | the whole `zeo-bin` release build, unprivileged: compile and install under `release/configroot`, then `make-bin-release.sh` |
+| `scripts/make-bin-release.sh <PF> <builddir>` | package a finished `x86-64-v3` build of zeo as the `zeo-bin` distfile, with `PROVENANCE.txt`; refuses a non-portable binary and never uploads — see [Releasing zeo-bin](#releasing-zeo-bin) |
 | `scripts/patch-branches.sh <PF> [--force]` | rebuild one branch per patch in the prepared tree, so a patch can be fixed as code |
 | `scripts/selftest.sh` | unit coverage, entirely on temporary fixtures — never touches the overlay or the real distfile |
 | `scripts/live-proof.py script <steps.json>` | drive a running Zed through the desktop portal and capture what a patch renders — the half `verify.sh` cannot answer |
@@ -208,7 +216,7 @@ series names and reports what the overlay has spare, but neither side reads the
 ebuild — so a patch the ebuild quietly stopped applying stays present in both
 and looks correct from either end.
 
-With no `<PF>` the version comes from the overlay when it holds exactly one zed
+With no `<PF>` the version comes from the overlay when it holds exactly one zeo
 ebuild. Exit is 0 when everything agrees, 1 on drift, 2 on an environment
 problem. `patches ↔ source` reports `SKIP` rather than failing when no tree has
 been prepared — nothing drifted, the question simply was not asked.
@@ -257,3 +265,27 @@ files and this README.
 excerpts of Zed's own source and remain under Zed's license (GPL-3.0). The MIT grant
 above cannot and does not relicense that material; it applies to the tooling that
 manages the patches, not to the upstream code they carry.
+
+## Releasing zeo-bin
+
+`zeo-bin` is the same build as `zeo` at the same `PV`, compiled once here and
+published to the overlay's R2 bucket (`distfiles.obentoo.org`). The host's own
+`make.conf` targets `znver5` and *appends* that to any `RUSTFLAGS` passed on the
+command line, so the build runs under the versioned `release/configroot/` instead,
+which targets `x86-64-v3`. No root is needed: `ebuild` runs unprivileged here.
+
+```bash
+scripts/release-zeo-bin.sh <PF>           # build (reused if present) + package
+scripts/release-zeo-bin.sh <PF> --fresh   # discard the previous build first
+```
+
+The script checks the flags and scans the binary for AVX-512 before writing
+`${DISTDIR}/zeo-bin-<PV>-amd64.tar.xz`, then prints the upload command. Uploading is
+a publication: it waits for an explicit go-ahead every time. Then the `zeo-bin`
+ebuild's `Manifest` is regenerated against the uploaded file. The archive is
+deterministic — the same build gives the same sha256 — so a rerun does not
+invalidate a Manifest already made from it.
+
+What this does not prove: the binary has never run on a CPU below this host's. Its
+portability rests on the flags and on the absence of AVX-512, not on an execution.
+

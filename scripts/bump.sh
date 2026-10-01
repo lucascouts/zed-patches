@@ -70,7 +70,7 @@ if [[ -z "${to}" ]]; then
 	shopt -s nullglob
 	ebuilds=("${overlay}/${ZP_CATEGORY_PATH}"/*.ebuild)
 	shopt -u nullglob
-	((${#ebuilds[@]} == 1)) || die 2 "expected exactly one zed ebuild in ${overlay}/${ZP_CATEGORY_PATH}, found ${#ebuilds[@]}; name the target with --to"
+	((${#ebuilds[@]} == 1)) || die 2 "expected exactly one ebuild in ${overlay}/${ZP_CATEGORY_PATH}, found ${#ebuilds[@]}; name the target with --to"
 	to="${ebuilds[0]##*/}"; to="${to%.ebuild}"
 fi
 

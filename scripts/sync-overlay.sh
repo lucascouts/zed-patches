@@ -5,7 +5,7 @@
 #
 # Verification is a gate, not a suggestion: verify.sh runs first and its status is
 # propagated, so files/ can never receive a patch nobody checked. Writes are scoped
-# to app-editors/zed/files/ and only to files the series names -- the ebuild's
+# to app-editors/zeo/files/ and only to files the series names -- the ebuild's
 # PATCHES+=() blocks encode USE logic no copy step can infer, and are never touched.
 #
 # Exit: 0 synchronized · verify.sh's status when verification fails · 2 environment

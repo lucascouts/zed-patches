@@ -3,9 +3,10 @@
 #
 #     prepare-tree.sh <PF> [--force]
 #
-# Extracts ${DISTDIR}/<PF>.tar.gz into <workroot>/zed-<EGIT_COMMIT>/ and gives it
-# a baseline commit, so any later edit can be regenerated as a patch and the
-# untouched source restored. The distfile is the one Portage already fetched and
+# Extracts the Zed distfile (whatever the ebuild's SRC_URI renames the archive
+# to) into <workroot>/zed-<EGIT_COMMIT>/ and gives it a baseline
+# commit, so any later edit can be regenerated as a patch and the untouched
+# source restored. The distfile is the one Portage already fetched and
 # checksummed: nothing here downloads.
 #
 # Exit: 0 prepared or reused · 2 environment problem · tar's own status if the

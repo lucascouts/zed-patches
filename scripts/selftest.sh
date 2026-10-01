@@ -18,7 +18,8 @@ FAIL=0
 CURRENT=""
 
 FIXTURE_COMMIT="1111111111111111111111111111111111111111"
-FIXTURE_PV="zed-9.9.9_pre20260101"
+FIXTURE_PV="zeo-0.9.9_p20260101"
+FIXTURE_DISTFILE="zed-${FIXTURE_COMMIT}.tar.gz"
 
 case_start() {
 	CURRENT="$1"
@@ -87,13 +88,13 @@ tree_checksum() {
 # make_ebuild <dir> <commit|-> — an ebuild carrying (or missing) EGIT_COMMIT.
 make_ebuild() {
 	local dir="$1" commit="$2"
-	mkdir -p "${dir}/app-editors/zed/files"
+	mkdir -p "${dir}/app-editors/zeo/files"
 	{
 		echo 'EAPI=8'
 		[[ "${commit}" == "-" ]] || echo "EGIT_COMMIT=\"${commit}\""
 		# shellcheck disable=SC2016  # ebuild syntax written verbatim; must not expand here
-		echo 'SRC_URI="https://example.invalid/${EGIT_COMMIT}.tar.gz -> ${PF}.tar.gz"'
-	} >"${dir}/app-editors/zed/${FIXTURE_PV}.ebuild"
+		echo 'SRC_URI="https://example.invalid/${EGIT_COMMIT}.tar.gz -> zed-${EGIT_COMMIT}.tar.gz"'
+	} >"${dir}/app-editors/zeo/${FIXTURE_PV}.ebuild"
 }
 
 # make_distfile <distdir> <root-dir-name> — a tarball with a known root.
@@ -104,7 +105,7 @@ make_distfile() {
 	mkdir -p "${stage}/${root}/src"
 	printf 'fn main() {\n    println!("one");\n}\n' >"${stage}/${root}/src/main.rs"
 	printf 'fn helper() {\n    let x = 1;\n}\n' >"${stage}/${root}/src/lib.rs"
-	tar -czf "${distdir}/${FIXTURE_PV}.tar.gz" -C "${stage}" "${root}"
+	tar -czf "${distdir}/${FIXTURE_DISTFILE}" -C "${stage}" "${root}"
 	rm -rf "${stage}"
 }
 
@@ -150,6 +151,40 @@ test_lib_falls_back_to_default_distdir() {
 	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
 	out="$(PATH="/nonexistent" ZP_OVERLAY="${tmp}/overlay" "${BASH}" -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'; printf '%s' \"\${ZP_DISTFILE}\"" 2>&1)"
 	assert_contains "${out}" "/var/cache/distfiles" && ok
+	rm -rf "${tmp}"
+}
+
+test_lib_names_distfile_from_src_uri() {
+	case_start "lib: the distfile is the name SRC_URI gives the archive, not the PF"
+	local tmp out
+	tmp="$(mktemp -d)"
+	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
+	out="$(ZP_OVERLAY="${tmp}/overlay" ZP_DISTDIR="${tmp}/d" bash -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'; printf '%s' \"\${ZP_DISTFILE}\"" 2>&1)"
+	assert_equal "${tmp}/d/${FIXTURE_DISTFILE}" "${out}" && ok
+	rm -rf "${tmp}"
+}
+
+test_lib_distfile_expands_pf() {
+	case_start "lib: a \${PF}.tar.gz rename (the old zed shape) expands to the PF"
+	local tmp out
+	tmp="$(mktemp -d)"
+	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
+	sed -i 's|-> zed-\${EGIT_COMMIT}.tar.gz|-> \${PF}.tar.gz|' "${tmp}/overlay/app-editors/zeo/${FIXTURE_PV}.ebuild"
+	out="$(ZP_OVERLAY="${tmp}/overlay" ZP_DISTDIR="${tmp}/d" bash -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'; printf '%s' \"\${ZP_DISTFILE}\"" 2>&1)"
+	assert_equal "${tmp}/d/${FIXTURE_PV}.tar.gz" "${out}" && ok
+	rm -rf "${tmp}"
+}
+
+test_lib_rejects_ebuild_without_archive_rename() {
+	case_start "lib: dies with status 2 when SRC_URI renames no archive"
+	local tmp out status
+	tmp="$(mktemp -d)"
+	make_ebuild "${tmp}/overlay" "${FIXTURE_COMMIT}"
+	sed -i '/^SRC_URI=/d' "${tmp}/overlay/app-editors/zeo/${FIXTURE_PV}.ebuild"
+	out="$(ZP_OVERLAY="${tmp}/overlay" bash -c "source '${SCRIPTS}/lib.sh'; resolve_version '${FIXTURE_PV}'" 2>&1)"
+	status=$?
+	assert_status 2 "${status}" &&
+		assert_contains "${out}" "SRC_URI" && ok
 	rm -rf "${tmp}"
 }
 
@@ -285,7 +320,7 @@ test_prepare_refuses_missing_distfile() {
 	local tmp out status
 	tmp="$(mktemp -d)"
 	prepare_env "${tmp}"
-	rm "${tmp}/distfiles/${FIXTURE_PV}.tar.gz"
+	rm "${tmp}/distfiles/${FIXTURE_DISTFILE}"
 	out="$(run_prepare "${tmp}")"
 	status=$?
 	assert_status 2 "${status}" &&
@@ -584,7 +619,7 @@ test_verify_applies_series_cumulatively() {
 add_ebuild_patches() {
 	local overlay="$1"
 	shift
-	local ebuild="${overlay}/app-editors/zed/${FIXTURE_PV}.ebuild" name
+	local ebuild="${overlay}/app-editors/zeo/${FIXTURE_PV}.ebuild" name
 	{
 		echo 'src_prepare() {'
 		echo '	PATCHES+=('
@@ -624,7 +659,7 @@ test_sync_refuses_unverified() {
 	verify_env "${tmp}" "broken"
 	out="$(run_sync "${tmp}")"
 	status=$?
-	count="$(find "${tmp}/overlay/app-editors/zed/files" -name '*.patch' | wc -l)"
+	count="$(find "${tmp}/overlay/app-editors/zeo/files" -name '*.patch' | wc -l)"
 	[[ "${status}" -ne 0 ]] || {
 		no "expected a non-zero exit"
 		rm -rf "${tmp}"
@@ -640,11 +675,11 @@ test_sync_copies_verified_series() {
 	local tmp status count before after
 	tmp="$(mktemp -d)"
 	verify_env "${tmp}"
-	before="$(sha256sum "${tmp}/overlay/app-editors/zed/${FIXTURE_PV}.ebuild" | cut -d' ' -f1)"
+	before="$(sha256sum "${tmp}/overlay/app-editors/zeo/${FIXTURE_PV}.ebuild" | cut -d' ' -f1)"
 	run_sync "${tmp}" >/dev/null
 	status=$?
-	after="$(sha256sum "${tmp}/overlay/app-editors/zed/${FIXTURE_PV}.ebuild" | cut -d' ' -f1)"
-	count="$(find "${tmp}/overlay/app-editors/zed/files" -name '*.patch' | wc -l)"
+	after="$(sha256sum "${tmp}/overlay/app-editors/zeo/${FIXTURE_PV}.ebuild" | cut -d' ' -f1)"
+	count="$(find "${tmp}/overlay/app-editors/zeo/files" -name '*.patch' | wc -l)"
 	assert_status 0 "${status}" &&
 		assert_equal "2" "${count}" &&
 		assert_equal "${before}" "${after}" && ok
@@ -657,7 +692,7 @@ test_sync_dry_run_writes_nothing() {
 	tmp="$(mktemp -d)"
 	verify_env "${tmp}"
 	out="$(run_sync "${tmp}" "--dry-run")"
-	count="$(find "${tmp}/overlay/app-editors/zed/files" -name '*.patch' | wc -l)"
+	count="$(find "${tmp}/overlay/app-editors/zeo/files" -name '*.patch' | wc -l)"
 	assert_equal "0" "${count}" &&
 		assert_contains "${out}" "0001-first.patch" && ok
 	rm -rf "${tmp}"
@@ -668,12 +703,12 @@ test_sync_reports_orphans() {
 	local tmp out status
 	tmp="$(mktemp -d)"
 	verify_env "${tmp}"
-	: >"${tmp}/overlay/app-editors/zed/files/0099-orphan.patch"
+	: >"${tmp}/overlay/app-editors/zeo/files/0099-orphan.patch"
 	out="$(run_sync "${tmp}")"
 	status=$?
 	assert_status 0 "${status}" &&
 		assert_contains "${out}" "0099-orphan.patch" &&
-		{ [[ -f "${tmp}/overlay/app-editors/zed/files/0099-orphan.patch" ]] || {
+		{ [[ -f "${tmp}/overlay/app-editors/zeo/files/0099-orphan.patch" ]] || {
 			no "the orphan was deleted"
 			false
 		}; } && ok
@@ -745,7 +780,7 @@ test_checksync_detects_overlay_drift() {
 	verify_env "${tmp}"
 	add_ebuild_patches "${tmp}/overlay" "0001-first.patch" "0002-second.patch"
 	run_sync "${tmp}" >/dev/null
-	printf '\n# edited in the overlay only\n' >>"${tmp}/overlay/app-editors/zed/files/0001-first.patch"
+	printf '\n# edited in the overlay only\n' >>"${tmp}/overlay/app-editors/zeo/files/0001-first.patch"
 	out="$(run_checksync "${tmp}")"
 	status=$?
 	assert_status 1 "${status}" &&
@@ -1012,7 +1047,7 @@ test_advisory_skips_only_the_missing_lockfile() {
 # scripts/status.sh end to end and asserts the advisory verdict reaches THAT
 # script's own output, ahead of its first gated step (R2.9) — and status.sh
 # captures every delegated run into a variable, printing only the lines it
-# chooses to and only after the 'packaged zed' header, so output produced inside
+# chooses to and only after the 'packaged zeo' header, so output produced inside
 # a sub-shell can never land ahead of it.
 #
 # bump.sh cannot be run end to end here: its first step regenerates a patch
@@ -1066,8 +1101,8 @@ test_status_calls_the_advisory_step_in_its_own_body() {
 		bash "${status_sh}" 2>&1)"
 	status=$?
 
-	header='packaged zed'
-	before="${out%%${header}*}"
+	header='packaged zeo'
+	before="${out%%"${header}"*}"
 	adv_line="$(grep -n '^[[:space:]]*report_advisories' "${bump_sh}" | head -1 | cut -d: -f1)"
 	step_line="$(grep -n "1/4" "${bump_sh}" | head -1 | cut -d: -f1)"
 
@@ -1425,6 +1460,9 @@ main() {
 	test_lib_resolves_commit
 	test_lib_rejects_ebuild_without_commit
 	test_lib_falls_back_to_default_distdir
+	test_lib_names_distfile_from_src_uri
+	test_lib_distfile_expands_pf
+	test_lib_rejects_ebuild_without_archive_rename
 	test_lib_reads_overlay_from_config
 	test_lib_env_overrides_config
 	test_lib_rejects_config_naming_missing_dir

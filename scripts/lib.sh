@@ -15,7 +15,10 @@ set -euo pipefail
 # --- constants ---------------------------------------------------------------
 
 ZP_DEFAULT_DISTDIR="/var/cache/distfiles"
-ZP_CATEGORY_PATH="app-editors/zed"
+# The one package that carries the series. Until 2026-10-01 that was app-editors/zed;
+# since then zed builds upstream's releases unpatched and the snapshot plus this
+# series ships as Zeo, which versions itself.
+ZP_CATEGORY_PATH="app-editors/zeo"
 
 # The chain's npm lockfiles, relative to the chain root — the directory holding
 # all five projects, one level above this repository.
@@ -104,13 +107,47 @@ _zp_distdir() {
 	printf '%s' "${path:-${ZP_DEFAULT_DISTDIR}}"
 }
 
-# _zp_parse_commit <ebuild> — echo the EGIT_COMMIT assignment, or nothing.
+# _zp_parse_var <ebuild> <NAME> <value-regex> — echo the value of a top-level
+# NAME="..." assignment matching <value-regex>, or nothing.
 # Pure bash: no grep, no sed, so it survives an empty PATH.
-_zp_parse_commit() {
-	local ebuild="$1" line
+_zp_parse_var() {
+	local ebuild="$1" name="$2" value="$3" line
+	local re="^[[:space:]]*${name}=[\"\']?(${value})[\"\']?[[:space:]]*$"
 	while IFS= read -r line || [[ -n "${line}" ]]; do
-		if [[ "${line}" =~ ^[[:space:]]*EGIT_COMMIT=[\"\']?([0-9a-fA-F]+)[\"\']?[[:space:]]*$ ]]; then
+		if [[ "${line}" =~ ${re} ]]; then
 			printf '%s' "${BASH_REMATCH[1]}"
+			return 0
+		fi
+	done <"${ebuild}"
+	return 0
+}
+
+# _zp_parse_commit <ebuild> — echo the EGIT_COMMIT assignment, or nothing.
+_zp_parse_commit() {
+	_zp_parse_var "$1" EGIT_COMMIT '[0-9a-fA-F]+'
+}
+
+# _zp_parse_distfile <ebuild> <pf> <commit> — echo the file name SRC_URI gives
+# the Zed archive (the target of its "->"), with ${PF}, ${P}, ${PN}, ${PV} and
+# ${EGIT_COMMIT} expanded; nothing when the ebuild renames no archive.
+#
+# Read rather than assumed, because the name changed shape once already:
+# app-editors/zed named it ${PF}.tar.gz, app-editors/zeo names it after the commit.
+_zp_parse_distfile() {
+	local ebuild="$1" pf="$2" commit="$3" line name pn pv
+	local re='\$\{EGIT_COMMIT\}\.tar\.gz[[:space:]]+->[[:space:]]+([^[:space:]"]+)'
+	while IFS= read -r line || [[ -n "${line}" ]]; do
+		if [[ "${line}" =~ ${re} ]]; then
+			name="${BASH_REMATCH[1]}"
+			pn="${pf%%-[0-9]*}"
+			pv="${pf#"${pn}"-}"
+			pv="${pv%-r[0-9]*}"
+			name="${name//\$\{PF\}/${pf}}"
+			name="${name//\$\{P\}/${pn}-${pv}}"
+			name="${name//\$\{PN\}/${pn}}"
+			name="${name//\$\{PV\}/${pv}}"
+			name="${name//\$\{EGIT_COMMIT\}/${commit}}"
+			printf '%s' "${name}"
 			return 0
 		fi
 	done <"${ebuild}"
@@ -124,7 +161,7 @@ _zp_parse_commit() {
 # (plus ZP_REPO, ZP_DISTDIR and ZP_WORKROOT, which callers may also override).
 resolve_version() {
 	local pf="${1:-}"
-	[[ -n "${pf}" ]] || die 2 "resolve_version: no version given (expected a PF such as zed-1.18.0_pre20260822)"
+	[[ -n "${pf}" ]] || die 2 "resolve_version: no version given (expected a PF such as zeo-0.1.0_p20261001)"
 
 	ZP_REPO="${ZP_REPO:-$(_zp_repo_root)}"
 	ZP_OVERLAY="$(_zp_overlay)"
@@ -138,7 +175,10 @@ resolve_version() {
 	ZP_COMMIT="$(_zp_parse_commit "${ZP_EBUILD}")"
 	[[ -n "${ZP_COMMIT}" ]] || die 2 "no EGIT_COMMIT assignment in ${ZP_EBUILD}"
 
-	ZP_DISTFILE="${ZP_DISTDIR}/${pf}.tar.gz"
+	local distfile
+	distfile="$(_zp_parse_distfile "${ZP_EBUILD}" "${pf}" "${ZP_COMMIT}")"
+	[[ -n "${distfile}" ]] || die 2 "no '\${EGIT_COMMIT}.tar.gz -> <name>' in the SRC_URI of ${ZP_EBUILD}"
+	ZP_DISTFILE="${ZP_DISTDIR}/${distfile}"
 	ZP_WORKTREE="${ZP_WORKROOT}/zed-${ZP_COMMIT}"
 
 	export ZP_REPO ZP_OVERLAY ZP_DISTDIR ZP_WORKROOT
