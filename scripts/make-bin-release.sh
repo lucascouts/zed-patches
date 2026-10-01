@@ -10,20 +10,23 @@
 #         ebuild <overlay>/app-editors/zeo/<PF>.ebuild compile install
 #     make-bin-release.sh <PF> <tmp>/portage/app-editors/<PF>
 #
-# Writes ${DISTDIR}/zeo-bin-<PV>-amd64.tar.xz, whose single top directory holds
+# Writes ${DISTDIR}/zeo-bin-<PVR>-amd64.tar.xz, whose single top directory holds
 # the installed usr/ tree and PROVENANCE.txt, and prints the upload command.
-# It never uploads: publishing to R2 is a remote, outward-facing step that a
+# A name R2 already serves is checked first: identical bytes end the run with
+# nothing to upload, different bytes are refused (ZP_DISTFILES_URL overrides the
+# host, for testing). It never uploads: publishing to R2 is a remote, outward-facing step that a
 # human authorizes each time.
 #
 # Refuses to package a binary that is not portable: one built with a target CPU
 # other than x86-64-v3, or one carrying AVX-512 instructions.
 #
-# Exit: 0 written · 1 the build is not releasable · 2 environment problem.
+# Exit: 0 written or already published · 1 the build is not releasable, or its
+# name is taken on R2 by other bytes · 2 environment problem.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 usage() {
-	sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 	exit 2
 }
 
@@ -58,8 +61,11 @@ main() {
 		die 1 "zeo-editor carries AVX-512 instructions; it would SIGILL below AVX-512"
 	fi
 
+	# The revision stays in the name. A zeo revbump changes the binary, so it is a
+	# different artefact: dropping -rN would put new bytes under a name R2 already
+	# serves and a Manifest already pins. zeo-bin mirrors zeo's PVR, and its
+	# SRC_URI names ${PF} for the same reason.
 	local pv="${pf#zeo-}" name stage out
-	pv="${pv%-r[0-9]*}"
 	name="zeo-bin-${pv}"
 	out="${ZP_DISTDIR}/${name}-amd64.tar.xz"
 	stage="$(mktemp -d)"
@@ -101,9 +107,23 @@ main() {
 	XZ_OPT=-9T0 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${epoch}" \
 		-C "${stage}" -cJf "${out}" "${name}"
 
+	# A name already on R2 is a published artefact. Identical bytes mean there is
+	# nothing to upload; different bytes mean this build must not take that name,
+	# because the zeo-bin Manifest pins the published ones.
+	local url="${ZP_DISTFILES_URL:-https://distfiles.obentoo.org}/${name}-amd64.tar.xz" remote_sum local_sum
+	local_sum="$(sha256sum "${out}" | cut -d' ' -f1)"
+	if curl -sfI "${url}" >/dev/null 2>&1; then
+		remote_sum="$(curl -sfL "${url}" | sha256sum | cut -d' ' -f1)"
+		if [[ "${remote_sum}" == "${local_sum}" ]]; then
+			printf 'already published with identical bytes: %s\n' "${url}"
+			return 0
+		fi
+		die 1 "${url} is already published with different bytes (${remote_sum:0:12} vs ${local_sum:0:12}); revbump zeo instead of reusing its name"
+	fi
+
 	cat <<EOF
 wrote ${out} ($(stat -c %s "${out}") bytes)
-sha256 $(sha256sum "${out}" | cut -d' ' -f1)
+sha256 ${local_sum}
 
 next, once publishing is authorized:
   1. from the overlay checkout (wrangler profile 'bentoo'):

@@ -11,7 +11,7 @@
 #      enough. PORTAGE_INST_UID/GID are the caller's, because install(1) cannot
 #      chown to root without root; the tarball resets ownership to 0:0 anyway.
 #   2. make-bin-release.sh, which refuses a non-v3 or AVX-512 binary and writes
-#      ${DISTDIR}/zeo-bin-<PV>-amd64.tar.xz with PROVENANCE.txt.
+#      ${DISTDIR}/zeo-bin-<PVR>-amd64.tar.xz with PROVENANCE.txt.
 #
 # A build directory left by an earlier run of the same PF is reused, so a failed
 # install does not cost the 20-minute compile again; --fresh discards it.

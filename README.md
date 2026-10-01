@@ -280,7 +280,10 @@ scripts/release-zeo-bin.sh <PF> --fresh   # discard the previous build first
 ```
 
 The script checks the flags and scans the binary for AVX-512 before writing
-`${DISTDIR}/zeo-bin-<PV>-amd64.tar.xz`, then prints the upload command. Uploading is
+`${DISTDIR}/zeo-bin-<PVR>-amd64.tar.xz` — the zeo revision stays in the name, since a
+revbump is a different binary — and compares it with what R2 already serves under that
+name: identical bytes mean nothing to upload, different bytes are refused, because the
+`zeo-bin` Manifest pins the published ones. Otherwise it prints the upload command. Uploading is
 a publication: it waits for an explicit go-ahead every time. Then the `zeo-bin`
 ebuild's `Manifest` is regenerated against the uploaded file. The archive is
 deterministic — the same build gives the same sha256 — so a rerun does not
