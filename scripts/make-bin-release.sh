@@ -56,12 +56,25 @@ main() {
 		die 1 "RUSTFLAGS names a host-specific CPU: ${rustflags}"
 	[[ "${cflags}" == *"-march=x86-64-v3"* ]] || die 1 "CFLAGS does not target x86-64-v3: ${cflags}"
 
-	# AVX-512 uses the zmm registers and the k0-k7 opmask registers; neither
-	# exists below it, so one occurrence is enough to refuse.
-	printf 'scanning %s for AVX-512 instructions\n' "${image}/usr/libexec/zeo-editor"
-	if objdump -d --no-show-raw-insn "${image}/usr/libexec/zeo-editor" | grep -qE '%zmm[0-9]|\{%k[1-7]\}'; then
-		die 1 "zeo-editor carries AVX-512 instructions; it would SIGILL below AVX-512"
-	fi
+	# AVX-512, on the unstripped binary so each instruction has a function name.
+	# Assembly kernels that choose an AVX-512 path at run time (dav1d, aws-lc)
+	# are fine; compiler-generated Rust or C++ code is not, because it never
+	# checks the CPU. The disassembly is read whole: the old
+	# `objdump | grep -q` exited 141 from SIGPIPE under pipefail and so passed
+	# every release until 0.1.0_p20261003-r1, which carried 85 such functions
+	# from this host's Rust standard library (built for znver5). zeo-bin is
+	# built by release-portable.sh since -r2; this check keeps this path honest.
+	local unstripped
+	unstripped="$(find "${builddir}/work" -path '*/target/release/zeo' -type f 2>/dev/null | head -1)"
+	[[ -n "${unstripped}" ]] || die 2 "no unstripped target/release/zeo under ${builddir}/work"
+	printf 'scanning %s for compiler-generated AVX-512\n' "${unstripped}"
+	local avx512_fns
+	avx512_fns="$(objdump -d --no-show-raw-insn "${unstripped}" | awk '
+		/^[0-9a-f]+ <.*>:$/ { fn = $2 }
+		/%zmm[0-9]|\{%k[1-7]\}/ { if (fn ~ /^<_R/ || fn ~ /^<_ZN/) bad[fn] = 1 }
+		END { for (f in bad) n++; print n + 0 }')"
+	(( avx512_fns == 0 )) ||
+		die 1 "${avx512_fns} compiler-generated functions use AVX-512; the binary would SIGILL below AVX-512"
 
 	# The revision stays in the name. A zeo revbump changes the binary, so it is a
 	# different artefact: dropping -rN would put new bytes under a name a release

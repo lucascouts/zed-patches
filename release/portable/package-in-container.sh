@@ -24,6 +24,18 @@ epoch=0
 XZ_OPT=-9T0 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${epoch}" \
 	-C /out -cJf "${dist}/zeo-${ZEO_PVR}-x86_64.tar.xz" "zeo-${ZEO_PVR}"
 
+# 1b. The zeo-bin tarball: the same tree under the name and layout the
+# app-editors/zeo-bin ebuild unpacks -- zeo-bin-<PVR>/{usr,PROVENANCE.txt}.
+# Since 0.1.0_p20261003-r2 zeo-bin is this build, not a Gentoo-host one.
+log "zeo-bin tarball"
+zbin="/out/zeo-bin-${ZEO_PVR}"
+rm -rf "${zbin}"
+mkdir -p "${zbin}"
+cp -a "${stage}/usr" "${stage}/PROVENANCE.txt" "${zbin}/"
+XZ_OPT=-9T0 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${epoch}" \
+	-C /out -cJf "${dist}/zeo-bin-${ZEO_PVR}-amd64.tar.xz" "zeo-bin-${ZEO_PVR}"
+rm -rf "${zbin}"
+
 # 2. .deb and .rpm. 0.1.0_p20261003-r1 -> version 0.1.0~p20261003, release 2.
 revision=0
 [[ "${ZEO_PVR}" =~ -r([0-9]+)$ ]] && revision="${BASH_REMATCH[1]}"

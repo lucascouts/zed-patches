@@ -15,9 +15,11 @@
 #   4. SHA256SUMS over every artefact
 #
 # Inputs come from where the zeo ebuild takes them: the Zed archive in DISTDIR,
-# patches/<PF>/, the icons and the prebuilt WebRTC from the overlay. The cargo
-# cache and target live under ZP_PORTABLE_DIR (default ~/.cache/zeo-portable), so
-# a rerun recompiles little; --skip-build reuses the staged tree outright.
+# patches/<PF>/, the icons and the prebuilt WebRTC from the overlay. Everything
+# else lives under ZP_PORTABLE_DIR (default ~/.cache/zeo-portable): <PF>/ holds
+# one version's source and target, so a rerun recompiles little; sccache/ and
+# cargo-home/ are shared by every version, so a new one starts warm and downloads
+# no crate twice. --skip-build reuses the staged tree outright.
 #
 # It never publishes. The artefacts land in ${ZP_PORTABLE_DIR}/<PF>/out/dist,
 # ready for `gh release upload` once a human authorises it.
@@ -43,7 +45,8 @@ main() {
 	local pvr="${pf#zeo-}" pv
 	pv="${pvr%-r[0-9]*}"
 	local here="${ZP_REPO}/release/portable"
-	local root="${ZP_PORTABLE_DIR:-${HOME}/.cache/zeo-portable}/${pf}"
+	local cache="${ZP_PORTABLE_DIR:-${HOME}/.cache/zeo-portable}"
+	local root="${cache}/${pf}"
 	local patches="${ZP_REPO}/patches/${pf}"
 	local files="${ZP_OVERLAY}/${ZP_CATEGORY_PATH}/files"
 	local webrtc
@@ -55,7 +58,9 @@ main() {
 	[[ -f "${files}/app-icon-zeo.png" ]] || die 2 "icons missing from ${files}"
 	command -v docker >/dev/null || die 2 "docker is required"
 
-	mkdir -p "${root}/work" "${root}/out"
+	local source_sha256
+	source_sha256="$(sha256sum "${ZP_DISTFILE}" | cut -d' ' -f1)"
+	mkdir -p "${root}/work" "${root}/out" "${cache}/sccache" "${cache}/cargo-home"
 	local image
 	image="zeo-portable:$(sha256sum "${here}/Containerfile" | cut -c1-12)"
 	printf 'image %s\n' "${image}"
@@ -67,7 +72,8 @@ main() {
 	fi
 
 	local run=(docker run --rm --user "$(id -u):$(id -g)" -e HOME=/work
-		-e "ZEO_PV=${pv}" -e "ZEO_PVR=${pvr}"
+		-e "ZEO_PV=${pv}" -e "ZEO_PVR=${pvr}" -e "ZEO_COMMIT=${ZP_COMMIT}"
+		-e "ZEO_SOURCE_SHA256=${source_sha256}"
 		-v "${ZP_DISTFILE}:/in/zed.tar.gz:ro"
 		-v "${patches}:/in/patches:ro"
 		-v "${files}:/in/icons:ro"
@@ -75,6 +81,8 @@ main() {
 		-v "${here}:/pkg:ro"
 		-v "${root}/work:/work"
 		-v "${root}/out:/out"
+		-v "${cache}/sccache:/sccache"
+		-v "${cache}/cargo-home:/cargo-home"
 		"${image}")
 
 	if (( ! skip_build )); then

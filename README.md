@@ -60,7 +60,8 @@ isolation — the default run applies **every** patch, which is the strictest ca
 | `scripts/sync-overlay.sh <PF> [--dry-run]` | copy the verified series into the overlay's `files/`, reporting orphans |
 | `scripts/refresh.sh --from <PF_old> --to <PF_new>` | carry the series onto a new packaged commit, regenerating each patch |
 | `scripts/check-sync.sh [<PF>]` | verify the series against the ebuild, the overlay and the packaged source, in one pass |
-| `scripts/release-zeo-bin.sh <PF> [--fresh]` | the whole `zeo-bin` release build, unprivileged: compile and install under `release/configroot`, then `make-bin-release.sh` |
+| `scripts/release-portable.sh <PF> [--skip-build] [--no-flatpak]` | the release build since `-r2`: compile the series in a Debian 12 container and package `zeo-bin`, `.deb`, `.rpm`, AppImage, Flatpak and a tarball; never uploads — see [Releasing zeo-bin](#releasing-zeo-bin) |
+| `scripts/release-zeo-bin.sh <PF> [--fresh]` | the Gentoo-host `zeo-bin` build used up to `-r1`, unprivileged: compile and install under `release/configroot`, then `make-bin-release.sh` |
 | `scripts/make-bin-release.sh <PF> <builddir>` | package a finished `x86-64-v3` build of zeo as the `zeo-bin` distfile, with `PROVENANCE.txt`; refuses a non-portable binary and never uploads — see [Releasing zeo-bin](#releasing-zeo-bin) |
 | `scripts/patch-branches.sh <PF> [--force]` | rebuild one branch per patch in the prepared tree, so a patch can be fixed as code |
 | `scripts/selftest.sh` | unit coverage, entirely on temporary fixtures — never touches the overlay or the real distfile |
@@ -268,33 +269,73 @@ manages the patches, not to the upstream code they carry.
 
 ## Releasing zeo-bin
 
-`zeo-bin` is the same build as `zeo` at the same `PV`, compiled once here and
-published as an asset of the Zeo GitHub release tagged `v<PVR>`
+`zeo-bin` is the same Zed commit and patch series as `zeo` at the same `PV`, compiled
+once here and published as an asset of the Zeo GitHub release tagged `v<PVR>`
 ([`zeo-workspace/zeo` releases](https://github.com/zeo-workspace/zeo/releases)), beside
 its `PROVENANCE` and `SHA256SUMS`; the `zeo-bin` ebuild's `SRC_URI` points there. Until
 2026-10-03 the tarballs were served from the overlay's R2 bucket
-(`distfiles.obentoo.org`), which still holds the three published before the move. The host's own
-`make.conf` targets `znver5` and *appends* that to any `RUSTFLAGS` passed on the
-command line, so the build runs under the versioned `release/configroot/` instead,
-which targets `x86-64-v3`. No root is needed: `ebuild` runs unprivileged here.
+(`distfiles.obentoo.org`), which still holds the three published before the move.
+
+### Since `-r2`: the portable build
+
+```bash
+scripts/release-portable.sh <PF>                # build + package everything
+scripts/release-portable.sh <PF> --skip-build   # repackage the staged tree
+scripts/release-portable.sh <PF> --no-flatpak   # skip the host flatpak-builder step
+```
+
+It compiles inside `release/portable/Containerfile` — Debian 12 (glibc 2.36), the
+official `rustup` toolchain the Zed commit pins, `x86-64-v3` — and writes to
+`${ZP_PORTABLE_DIR:-~/.cache/zeo-portable}/<PF>/out/dist`: the `zeo-bin` tarball under
+the name and layout the ebuild unpacks, a plain tarball, `.deb`, `.rpm`, AppImage,
+Flatpak bundle and `SHA256SUMS-portable-<PVR>`. Before packaging it refuses a binary
+needing a glibc newer than 2.36 or carrying compiler-generated AVX-512, and writes
+`PROVENANCE.txt` naming the real toolchain.
+
+**Why `zeo-bin` moved here.** Every `zeo-bin` up to `-r1` can die with *illegal
+instruction* on an `x86-64-v3` CPU without AVX-512: this host's Rust standard library is
+built for `znver5`, and the precompiled `std` ignores the `RUSTFLAGS` of the build, so
+`-r1` carried 85 AVX-512 functions. The check meant to refuse that never worked —
+`objdump | grep -q` under `pipefail` exited 141 from `SIGPIPE`, which read as "no
+match". Both scanners now read the whole disassembly and only flag Rust/C++ symbols:
+hand-written assembly kernels (dav1d, aws-lc) pick their AVX-512 path at run time and
+are fine.
+
+**Caches.** `<PF>/work/` holds one version's source and target. `sccache/` and
+`cargo-home/` beside it are shared by every version, so a new version starts warm and
+downloads no crate twice. Measured on `-r2` with an empty target: 16m42s cold, 5m44s
+warm, 99.9 % sccache hits. It is a cache of its own, not Portage's
+`/var/cache/sccache`: sccache keys each entry on the exact `rustc`, so the Gentoo
+compiler's entries can never hit this toolchain — and they are mode 0600, owned by
+`portage`, unreadable from here anyway.
+
+### Up to `-r1`: the Gentoo-host build
+
+The host's own `make.conf` targets `znver5` and *appends* that to any `RUSTFLAGS`
+passed on the command line, so this build runs under the versioned
+`release/configroot/` instead, which targets `x86-64-v3`. No root is needed: `ebuild`
+runs unprivileged here. It is kept as a second route, but see above: the `std` it links
+is still the host's.
 
 ```bash
 scripts/release-zeo-bin.sh <PF>           # build (reused if present) + package
 scripts/release-zeo-bin.sh <PF> --fresh   # discard the previous build first
 ```
 
-The script checks the flags and scans the binary for AVX-512 before writing
-`${DISTDIR}/zeo-bin-<PVR>-amd64.tar.xz` — the zeo revision stays in the name, since a
-revbump is a different binary — and compares it with what the `v<PVR>` release already
-serves under that name: identical bytes mean nothing to upload, different bytes are
-refused, because the `zeo-bin` Manifest pins the published ones. Otherwise it prints the
-release steps: tag `v<PVR>` in this repository (on the commit holding `patches/<PF>/`)
-and in `zeo`, then `gh release create` with the three assets. Publishing waits for an
-explicit go-ahead every time. Then the `zeo-bin` ebuild's `Manifest` is regenerated
-against the published file. The archive is
-deterministic — the same build gives the same sha256 — so a rerun does not
-invalidate a Manifest already made from it.
+### Publishing, either way
+
+The tarball is `zeo-bin-<PVR>-amd64.tar.xz` — the zeo revision stays in the name, since
+a revbump is a different binary. Once published, its bytes are fixed, because the
+`zeo-bin` Manifest pins them: `make-bin-release.sh` compares its output with what the
+`v<PVR>` release already serves and refuses different bytes; `release-portable.sh` does
+not, so compare `sha256sum` with the served asset by hand before any re-upload. The
+release steps: tag `v<PVR>` in this repository (on the commit holding
+`patches/<PF>/`) and in `zeo`, then `gh release create` with the assets. Publishing
+waits for an explicit go-ahead every time. Then the `zeo-bin` ebuild's `Manifest` is
+regenerated against the published file. The archives are deterministic — the same
+build gives the same sha256 — so a rerun does not invalidate a Manifest already made
+from it.
 
 What this does not prove: the binary has never run on a CPU below this host's. Its
-portability rests on the flags and on the absence of AVX-512, not on an execution.
-
+portability rests on the flags and on the absence of compiler-generated AVX-512, not on
+an execution.
