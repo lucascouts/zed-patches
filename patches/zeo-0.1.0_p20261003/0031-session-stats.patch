@@ -1,0 +1,513 @@
+From 2fbef56c8d5c4ff1dd456822cd34228132774b2b Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@protonmail.com>
+Date: Sun, 27 Sep 2026 19:28:31 -0300
+Subject: [PATCH] feat(agent_ui): session time and tool usage in the turn stats
+
+The turn stats answered one question -- how long did the last turn take --
+and only past 30 seconds, so a short turn left no trace and nothing added the
+turns up. This extends the same row, behind the same show_turn_stats setting:
+
+- The turn's duration is always shown, while it runs and when it ends. The
+  30-second threshold existed to keep a quick reply from flashing a counter;
+  with the row now the place to read the session's pace, a missing number
+  reads as "not measured" rather than "short". STOPWATCH_THRESHOLD goes with
+  its last use. The token count keeps its own threshold, and no longer waits
+  for the clock to appear.
+
+- "<duration> total" sums the finished turns, plus the running one while it
+  runs. It lives on the view, not on the thread: it counts agent time since
+  the thread was opened in this window, says so in its tooltip, and starts
+  from zero when the thread is reopened. Persisting it would mean a field in
+  the thread metadata store for one number -- left for when it is asked for.
+
+- "<n> tool calls" counts the thread's tool-call entries, and its tooltip
+  breaks them down three ways: by tool; MCP calls by server, read off Claude
+  Code's mcp__<server>__<tool> naming; and the programs the terminal calls
+  ran. It is derived from the entries on every render of the last turn's
+  row, so it is right for a reopened thread too -- as far as the replayed
+  history reaches, which after a compaction is the summary onward.
+
+The tool name is ACP's own ToolCall.name, which this adapter sets on every
+tool call; an agent that sends none is counted by ToolKind instead.
+
+Programs come from the Execute calls' raw_input.command through a small
+scanner, not a shell parser: it splits on unquoted ;, |, && and ||, and on
+newlines; it skips heredoc bodies, so a python3 - <<'EOF' script is one
+python3 and not one program per line; it drops environment assignments,
+paths and comments; and it leaves out cd, export, set, unset, source and ".",
+which change the shell rather than run anything and would otherwise top
+every list. A program behind a wrapper (sudo make, xargs grep) counts as the
+wrapper. The scanner and the MCP naming carry unit tests.
+
+The row these join is the one 0026 moved to the left, clear of the floating
+controls; the items are joined by the row's existing separator dot.
+
+Pure Zed and generic ACP -- nothing needs the adapter -- so it rides the
+claude-agent-acp-plus flag BY CHOICE, like 0010, 0012, 0014 and 0026.
+---
+
+diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
+index 3894ce0..94a90f6 100644
+--- a/crates/agent_ui/src/conversation_view.rs
++++ b/crates/agent_ui/src/conversation_view.rs
+@@ -104,13 +104,13 @@ use crate::{
+     ToggleThinkingMode, UndoLastReject,
+ };
+ 
+-const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
+ const TOKEN_THRESHOLD: u64 = 250;
+ 
+ pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
+ 
+ pub(crate) mod elicitation;
+ mod message_queue;
++mod session_stats;
+ mod thread_search_bar;
+ mod thread_view;
+ pub use message_queue::*;
+diff --git a/crates/agent_ui/src/conversation_view/session_stats.rs b/crates/agent_ui/src/conversation_view/session_stats.rs
+new file mode 100644
+index 0000000..9bd3ea6
+--- /dev/null
++++ b/crates/agent_ui/src/conversation_view/session_stats.rs
+@@ -0,0 +1,255 @@
++use std::collections::BTreeMap;
++
++use acp_thread::AgentThreadEntry;
++use agent_client_protocol::schema::v2 as acp_v2;
++use gpui::{AnyElement, SharedString};
++use ui::prelude::*;
++
++/// Claude Code names a tool served by an MCP server `mcp__<server>__<tool>`.
++const MCP_TOOL_PREFIX: &str = "mcp__";
++
++/// Shell builtins that change the shell's own state rather than run a
++/// program. Counting them would bury the programs under a `cd` per command.
++const SHELL_BUILTINS: &[&str] = &["cd", "export", "set", "unset", "source", "."];
++
++/// The tool calls of one thread, grouped the way the turn stats list them.
++#[derive(Debug, Default, PartialEq)]
++pub(super) struct ToolUsage {
++    pub total: usize,
++    /// Every tool that is not an MCP tool, by name.
++    pub tools: BTreeMap<SharedString, usize>,
++    /// MCP tool calls, by the server that served them.
++    pub mcp_servers: BTreeMap<SharedString, usize>,
++    /// The programs the terminal tool calls ran. One call can run several
++    /// (`cargo fmt && cargo test`), so this is not a subset of `total`.
++    pub programs: BTreeMap<SharedString, usize>,
++}
++
++impl ToolUsage {
++    pub fn from_entries(entries: &[AgentThreadEntry]) -> Self {
++        let mut usage = Self::default();
++        for entry in entries {
++            let AgentThreadEntry::ToolCall(call) = entry else {
++                continue;
++            };
++            usage.total += 1;
++
++            let name = call
++                .tool_name
++                .clone()
++                .unwrap_or_else(|| format!("{:?}", call.kind()).into());
++            match mcp_server_name(&name) {
++                Some(server) => *usage.mcp_servers.entry(server.into()).or_default() += 1,
++                None => *usage.tools.entry(name).or_default() += 1,
++            }
++
++            if *call.kind() == acp_v2::ToolKind::Execute
++                && let Some(command) = call
++                    .raw_input
++                    .as_ref()
++                    .and_then(|input| input.get("command"))
++                    .and_then(|command| command.as_str())
++            {
++                for program in command_programs(command) {
++                    *usage
++                        .programs
++                        .entry(SharedString::from(program.to_owned()))
++                        .or_default() += 1;
++                }
++            }
++        }
++        usage
++    }
++}
++
++fn mcp_server_name(tool_name: &str) -> Option<&str> {
++    let server = tool_name
++        .strip_prefix(MCP_TOOL_PREFIX)?
++        .split("__")
++        .next()?;
++    (!server.is_empty()).then_some(server)
++}
++
++/// The programs a shell command runs, in order.
++///
++/// A heuristic, not a shell parser: it splits on the unquoted separators
++/// (`;`, `|`, `&&`, `||`, newline), skips heredoc bodies, and takes the first
++/// word of each segment that is not an environment assignment. A program
++/// launched through a wrapper (`xargs grep`, `sudo make`) counts as the
++/// wrapper.
++pub(super) fn command_programs(command: &str) -> Vec<&str> {
++    let mut programs = Vec::new();
++    let mut pending_heredocs: Vec<String> = Vec::new();
++    let mut quote: Option<char> = None;
++    let mut segment_start = 0;
++    let mut index = 0;
++
++    while let Some(character) = command[index..].chars().next() {
++        let rest = &command[index..];
++        let mut advance = character.len_utf8();
++        match (quote, character) {
++            (Some('"'), '\\') => advance += rest[1..].chars().next().map_or(0, char::len_utf8),
++            (Some(open), _) if character == open => quote = None,
++            (Some(_), _) => {}
++            (None, '\\') => advance += rest[1..].chars().next().map_or(0, char::len_utf8),
++            (None, '\'' | '"') => quote = Some(character),
++            (None, '<') if rest.starts_with("<<<") => advance = 3,
++            (None, '<') if rest.starts_with("<<") => {
++                pending_heredocs.extend(heredoc_delimiter_at(&rest[2..]));
++                advance = 2;
++            }
++            (None, '&') if rest.starts_with("&&") => {
++                push_program(&command[segment_start..index], &mut programs);
++                advance = 2;
++                segment_start = index + advance;
++            }
++            (None, ';' | '|') => {
++                push_program(&command[segment_start..index], &mut programs);
++                segment_start = index + advance;
++            }
++            (None, '\n') => {
++                push_program(&command[segment_start..index], &mut programs);
++                // Heredoc bodies start on the line after their `<<`, one after
++                // the other, each ending at the line that is its delimiter.
++                let mut line_start = index + 1;
++                for delimiter in pending_heredocs.drain(..) {
++                    while let Some(line) = command.get(line_start..)
++                        && !line.is_empty()
++                    {
++                        let line_end = line
++                            .find('\n')
++                            .map_or(command.len(), |offset| line_start + offset);
++                        let is_delimiter = command[line_start..line_end].trim() == delimiter;
++                        line_start = (line_end + 1).min(command.len());
++                        if is_delimiter {
++                            break;
++                        }
++                    }
++                }
++                advance = line_start - index;
++                segment_start = line_start;
++            }
++            _ => {}
++        }
++        index = (index + advance).min(command.len());
++    }
++
++    push_program(&command[segment_start..], &mut programs);
++    programs
++}
++
++fn heredoc_delimiter_at(rest: &str) -> Option<String> {
++    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
++    let word = rest.split_whitespace().next()?;
++    let delimiter = word.trim_matches(|character| matches!(character, '\'' | '"' | '\\'));
++    // `<<<` is a here-string, not a heredoc: it has no body to skip.
++    (!delimiter.is_empty() && !delimiter.starts_with('<')).then(|| delimiter.to_owned())
++}
++
++fn push_program<'a>(segment: &'a str, programs: &mut Vec<&'a str>) {
++    let program = segment
++        .split_whitespace()
++        .map(|word| word.trim_start_matches(['(', '{', '!']))
++        .find(|word| !word.is_empty() && !is_environment_assignment(word));
++    let Some(program) = program else {
++        return;
++    };
++    if program.starts_with('#') {
++        return;
++    }
++    let program = program.trim_matches(|character| matches!(character, '\'' | '"'));
++    let program = program.rsplit('/').next().unwrap_or(program);
++    if !program.is_empty() && !SHELL_BUILTINS.contains(&program) {
++        programs.push(program);
++    }
++}
++
++fn is_environment_assignment(word: &str) -> bool {
++    word.split_once('=').is_some_and(|(name, _)| {
++        !name.is_empty()
++            && name
++                .chars()
++                .all(|character| character.is_ascii_alphanumeric() || character == '_')
++    })
++}
++
++pub(super) fn render_tool_usage_tooltip(usage: &ToolUsage) -> AnyElement {
++    let section = |title: &'static str, counts: &BTreeMap<SharedString, usize>| {
++        let mut rows: Vec<_> = counts.iter().collect();
++        // Most used first; the map's own order breaks ties alphabetically.
++        rows.sort_by(|left, right| right.1.cmp(left.1));
++        (!rows.is_empty()).then(|| {
++            v_flex()
++                .gap_0p5()
++                .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
++                .children(rows.into_iter().map(|(name, count)| {
++                    h_flex()
++                        .gap_4()
++                        .justify_between()
++                        .child(Label::new(name.clone()).size(LabelSize::Small))
++                        .child(
++                            Label::new(count.to_string())
++                                .size(LabelSize::Small)
++                                .color(Color::Muted),
++                        )
++                }))
++        })
++    };
++
++    v_flex()
++        .gap_2()
++        .children(section("Tools", &usage.tools))
++        .children(section("MCP servers", &usage.mcp_servers))
++        .children(section("Commands", &usage.programs))
++        .into_any_element()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn splits_on_unquoted_separators() {
++        assert_eq!(
++            command_programs("cd crates && cargo fmt; cargo test | tail -5 || echo failed"),
++            ["cargo", "cargo", "tail", "echo"]
++        );
++    }
++
++    #[test]
++    fn keeps_quoted_separators_and_redirections() {
++        assert_eq!(
++            command_programs(r#"grep -n 'a\|b; c' file 2>&1 | head"#),
++            ["grep", "head"]
++        );
++        assert_eq!(command_programs(r#"git commit -m "x && y""#), ["git"]);
++    }
++
++    #[test]
++    fn skips_environment_assignments_paths_and_comments() {
++        assert_eq!(
++            command_programs("RUST_LOG=debug /usr/bin/cargo run\n# a comment\n./script/clippy"),
++            ["cargo", "clippy"]
++        );
++    }
++
++    #[test]
++    fn skips_heredoc_bodies() {
++        let command = "python3 - <<'EOF'\nimport sys; print(1) | x\nEOF\ngit status";
++        assert_eq!(command_programs(command), ["python3", "git"]);
++        assert_eq!(command_programs("cat <<<\"a; b\" && ls"), ["cat", "ls"]);
++    }
++
++    #[test]
++    fn unterminated_heredoc_counts_only_its_command() {
++        assert_eq!(command_programs("cat <<EOF\nnot | a program"), ["cat"]);
++        assert_eq!(command_programs("cat <<EOF"), ["cat"]);
++    }
++
++    #[test]
++    fn recognises_mcp_servers() {
++        assert_eq!(mcp_server_name("mcp__github__create_issue"), Some("github"));
++        assert_eq!(mcp_server_name("mcp____tool"), None);
++        assert_eq!(mcp_server_name("Bash"), None);
++    }
++}
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index 161bb8b..0ed6227 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -674,6 +674,9 @@ pub struct TurnFields {
+     pub turn_started_at: Option<Instant>,
+     pub turn_tokens: Option<u64>,
+     pub reported_activity_generation: Option<u64>,
++    /// The finished turns' durations, summed. Held by the view, so it counts
++    /// the agent time since this thread was opened here, not since it began.
++    pub session_duration: Duration,
+ }
+ 
+ /// How a tool call is rendered relative to its surroundings.
+@@ -1442,6 +1445,9 @@ impl ThreadView {
+             .turn_started_at
+             .take()
+             .map(|started| started.elapsed());
++        if let Some(duration) = self.turn_fields.last_turn_duration {
++            self.turn_fields.session_duration += duration;
++        }
+         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
+         self.turn_fields._turn_timer_task = None;
+     }
+@@ -7418,19 +7424,52 @@ impl ThreadView {
+ 
+         let last_turn_clock = show_stats
+             .then(|| {
+-                self.turn_fields
+-                    .last_turn_duration
+-                    .filter(|&duration| duration > STOPWATCH_THRESHOLD)
+-                    .map(|duration| {
+-                        Label::new(duration_alt_display(duration))
+-                            .size(LabelSize::Small)
+-                            .color(Color::Muted)
+-                    })
++                self.turn_fields.last_turn_duration.map(|duration| {
++                    div()
++                        .id("last-turn-duration")
++                        .child(
++                            Label::new(duration_alt_display(duration))
++                                .size(LabelSize::Small)
++                                .color(Color::Muted),
++                        )
++                        .tooltip(Tooltip::text("This Turn"))
++                })
+             })
+             .flatten();
+ 
+-        let last_turn_tokens_label = last_turn_clock
+-            .is_some()
++        let session_clock = show_stats
++            .then(|| {
++                let duration = self.turn_fields.session_duration;
++                (!duration.is_zero()).then(|| {
++                    div()
++                        .id("session-duration")
++                        .child(
++                            Label::new(format!("{} total", duration_alt_display(duration)))
++                                .size(LabelSize::Small)
++                                .color(Color::Muted),
++                        )
++                        .tooltip(Tooltip::text(
++                            "Agent time in this thread since it was opened",
++                        ))
++                })
++            })
++            .flatten();
++
++        let tool_usage = show_stats
++            .then(|| session_stats::ToolUsage::from_entries(self.thread.read(cx).entries()))
++            .filter(|usage| usage.total > 0)
++            .map(|usage| {
++                let label = format!("{} tool {}", usage.total, pluralize("call", usage.total));
++                let usage = Rc::new(usage);
++                div()
++                    .id("session-tool-usage")
++                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
++                    .tooltip(Tooltip::element(move |_window, _cx| {
++                        session_stats::render_tool_usage_tooltip(&usage)
++                    }))
++            });
++
++        let last_turn_tokens_label = show_stats
+             .then(|| {
+                 self.turn_fields
+                     .last_turn_tokens
+@@ -7509,6 +7548,8 @@ impl ThreadView {
+         if feedback_buttons.is_none()
+             && last_turn_clock.is_none()
+             && last_turn_tokens_label.is_none()
++            && session_clock.is_none()
++            && tool_usage.is_none()
+         {
+             return Empty.into_any_element();
+         }
+@@ -7520,8 +7561,6 @@ impl ThreadView {
+                 .alpha(0.5)
+         };
+ 
+-        let show_separator = last_turn_tokens_label.is_some() && last_turn_clock.is_some();
+-
+         // The stats sit on the left: the floating controls occupy the bottom
+         // right corner of the conversation, which is exactly where a
+         // right-aligned row ends up once the thread is scrolled to its end.
+@@ -7533,15 +7572,30 @@ impl ThreadView {
+             .opacity(0.4)
+             .hover(|s| s.opacity(1.))
+             .when(
+-                last_turn_tokens_label.is_some() || last_turn_clock.is_some(),
++                last_turn_tokens_label.is_some()
++                    || last_turn_clock.is_some()
++                    || session_clock.is_some()
++                    || tool_usage.is_some(),
+                 |this| {
++                    let stats = [
++                        last_turn_tokens_label.map(IntoElement::into_any_element),
++                        last_turn_clock.map(IntoElement::into_any_element),
++                        session_clock.map(IntoElement::into_any_element),
++                        tool_usage.map(IntoElement::into_any_element),
++                    ];
+                     this.child(
+-                        h_flex()
+-                            .px_1()
+-                            .gap_1()
+-                            .when_some(last_turn_tokens_label, |this, label| this.child(label))
+-                            .when(show_separator, |this| this.child(separator_dots()))
+-                            .when_some(last_turn_clock, |this, label| this.child(label)),
++                        h_flex().px_1().gap_1().children(
++                            stats
++                                .into_iter()
++                                .flatten()
++                                .enumerate()
++                                .flat_map(|(index, stat)| {
++                                    (index > 0)
++                                        .then(|| separator_dots().into_any_element())
++                                        .into_iter()
++                                        .chain([stat])
++                                }),
++                        ),
+                     )
+                 },
+             )
+@@ -8211,14 +8265,22 @@ impl ThreadView {
+ 
+     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
+         let show_stats = AgentSettings::get_global(cx).show_turn_stats;
+-        let elapsed_label = show_stats
++        let turn_elapsed = show_stats
+             .then(|| {
+-                self.turn_fields.turn_started_at.and_then(|started_at| {
+-                    let elapsed = started_at.elapsed();
+-                    (elapsed > STOPWATCH_THRESHOLD).then(|| duration_alt_display(elapsed))
+-                })
++                self.turn_fields
++                    .turn_started_at
++                    .map(|started_at| started_at.elapsed())
+             })
+             .flatten();
++        let elapsed_label = turn_elapsed.map(duration_alt_display);
++        let session_elapsed_label = turn_elapsed
++            .filter(|_| !self.turn_fields.session_duration.is_zero())
++            .map(|elapsed| {
++                format!(
++                    "{} total",
++                    duration_alt_display(self.turn_fields.session_duration + elapsed)
++                )
++            });
+ 
+         let is_blocked_on_terminal_command =
+             !confirmation && self.is_blocked_on_terminal_command(cx);
+@@ -8279,6 +8341,13 @@ impl ThreadView {
+                         .color(Color::Muted),
+                 )
+             })
++            .when_some(session_elapsed_label, |this, elapsed| {
++                this.child(
++                    Label::new(elapsed)
++                        .size(LabelSize::Small)
++                        .color(Color::Muted),
++                )
++            })
+             .when_some(turn_tokens_label, |this, tokens| {
+                 this.child(
+                     h_flex()
