@@ -1,0 +1,656 @@
+From 6be3a69a56a0cbfad1687c4020b4da15a807ca77 Mon Sep 17 00:00:00 2001
+From: zed-patches <zed-patches@localhost>
+Date: Sun, 13 Sep 2026 19:38:48 -0300
+Subject: [PATCH] zed://agent?session=<id> reopens an existing thread
+
+`zed://agent` could start a conversation but never return to one. The URL
+handler accepted a single parameter, `?prompt=`, and every path through it
+ended at `new_agent_thread_with_external_source_prompt` -- so a link could
+seed a new thread and nothing could point at a thread that already existed.
+
+Most of what was needed was already here, on both sides:
+
+  * `ThreadMetadataStore::entry_by_session` resolves a session id to the
+    thread's metadata row -- which records the agent that owns the thread
+    and the folders it was started in -- and `load_agent_thread` opens a
+    thread from those three facts. That pair is what the sidebar uses when a
+    thread is clicked.
+
+  * The id is not a Zed-local handle. It is the agent session id -- for an
+    ACP agent, the same id the agent itself uses. Verified against this
+    machine: two session ids out of `sidebar_threads` both have a Claude Code
+    transcript of the same name under ~/.claude/projects. So whatever produces
+    the link -- a share link, a shell script, a tray daemon reading agent hooks
+    -- needs to know nothing about Zed's internal thread ids.
+
+What was missing was the plumbing between them. This adds `session_id` and
+`cwd` to `OpenRequestKind::AgentPanel`, teaches `parse_agent_url` to read
+`session=` and `cwd=`, and routes a request carrying a session to
+`AgentPanel::open_thread_by_session`, in the window that holds its project.
+
+**The first version of this patch routed to `AgentPanel::open_thread`, in
+whichever window had focus, and both halves were wrong.** Measured on
+2026-09-29 with one Zed window per project on separate KDE virtual desktops:
+a tray notification for a thread of project A, clicked from the desktop
+showing project B, opened in B and failed with `no thread found with ID:
+SessionId(...)`. Two defects, each enough on its own:
+
+  * **The window.** `get_any_active_multi_workspace` returns the focused
+    window, and a click on a notification is focused wherever it happens --
+    the desktop it came from says nothing about the thread. The handler now
+    resolves the thread's folders first -- from its metadata row, else from
+    `cwd` -- and opens them through `workspace::open_paths`, the path `zed
+    <folder>` takes: the window already holding that project is found across
+    every window and raised, and one is opened only when none holds it. The
+    focused window remains only for a link that carries no folders, and for a
+    thread on a remote host, whose folders name paths on that host.
+
+  * **The agent.** `open_thread` is the share-link entry and resolves every id
+    to `Agent::NativeAgent`, passing no folders. For a session an external
+    agent owns -- every thread the Claude adapter produces -- the native agent
+    looks the id up in its own database, finds nothing, and fails; on the way,
+    the metadata row is rebound to the focused workspace's folders, so the
+    thread disappears from its own project's history. `open_thread_by_session`
+    takes the agent and the folders off the row instead, and only falls back
+    to `open_thread` when no row exists. Its test fails against `open_thread`
+    with `left: NativeAgent, right: Stub`, which is the defect exactly.
+
+The metadata store loads its rows from disk at startup, so the handler waits
+on `reload_task` before reading one: a link that launches Zed would otherwise
+find no row, fall through to `cwd`, and then to `open_thread`.
+
+`cwd` is a fallback, never an override: the row records where the thread was
+started, while `cwd` is where the link's producer saw the session -- for a
+tray fed by Claude Code hooks, possibly a subdirectory. Only absolute paths
+are accepted; a relative one would resolve against wherever Zed was started.
+
+Two decisions worth stating, because both are silent if wrong:
+
+  * **`session` wins over `prompt`.** A link that names a thread is asking for
+    that thread; seeding a prompt into it would put words into a conversation
+    the user reopened to read. They are mutually exclusive in practice, and the
+    precedence has a test rather than a comment.
+
+  * **An empty `session=` is not a session.** `?session=&prompt=hello` would
+    otherwise resolve to no thread AND swallow the prompt -- the one input that
+    could silently do nothing at all. It falls back to the prompt path, also
+    under test.
+
+An id this machine has never seen is not an error: it falls through to
+`open_thread`, which handles the unknown-session case by loading it -- what
+makes a native share link from another host work at all.
+
+Upstreamable as-is: it adds parameters to an existing scheme, changes no
+default, and every behaviour it exposes was already reachable from the
+sidebar.
+
+The handler also raises the window before touching the panel. Focusing a
+panel only moves focus *inside* Zed; on a desktop with virtual workspaces
+the window stays wherever it was left and the link looks like it did
+nothing. `activate_window` is the same call `zed://open` already makes.
+Whether the compositor honours it is its decision -- on Wayland a request
+from an unfocused process is usually refused, by design -- but asking is
+still correct, and on X11 it is enough on its own.
+---
+
+diff --git a/crates/agent_ui/src/agent_panel.rs b/crates/agent_ui/src/agent_panel.rs
+index c45f1f7..bd97bf0 100644
+--- a/crates/agent_ui/src/agent_panel.rs
++++ b/crates/agent_ui/src/agent_panel.rs
+@@ -1701,6 +1701,39 @@ impl AgentPanel {
+         }
+     }
+ 
++    /// Reopens a thread by its agent session id, with the agent that owns it.
++    ///
++    /// `open_thread` is the share-link entry and resolves every id to the
++    /// native agent. A session an external agent owns then fails with "no
++    /// thread found", and the metadata row is rebound to this workspace's
++    /// folders on the way, moving the thread out of its own project. This reads
++    /// the agent and the folders off the row instead -- what the sidebar does
++    /// when a thread is clicked -- and only falls back to `open_thread` when
++    /// this machine has no row for the session at all.
++    pub fn open_thread_by_session(
++        &mut self,
++        session_id: acp::SessionId,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let metadata = ThreadMetadataStore::try_global(cx)
++            .and_then(|store| store.read(cx).entry_by_session(&session_id).cloned());
++        let Some(metadata) = metadata else {
++            self.open_thread(session_id, None, None, window, cx);
++            return;
++        };
++        self.load_agent_thread(
++            crate::Agent::from(metadata.agent_id.clone()),
++            metadata.thread_id,
++            Some(metadata.folder_paths().clone()),
++            metadata.title.clone(),
++            true,
++            AgentThreadSource::AgentPanel,
++            window,
++            cx,
++        );
++    }
++
+     fn external_thread_by_session(
+         &mut self,
+         agent: Agent,
+@@ -8917,6 +8950,105 @@ mod tests {
+         });
+     }
+ 
++    /// A session reopened by id from another project's panel -- what a
++    /// `zed://agent?session=` link does -- comes back with the agent that owns
++    /// it, and its metadata row keeps the folders it was started in.
++    /// `open_thread` resolves every id to the native agent, which fails for an
++    /// external agent's session with "no thread found" and rebinds the row to
++    /// the panel's own folders.
++    #[gpui::test]
++    async fn test_open_thread_by_session_keeps_agent_and_folders(cx: &mut TestAppContext) {
++        init_test(cx);
++        cx.update(|cx| {
++            agent::ThreadStore::init_global(cx);
++            language_model::LanguageModelRegistry::test(cx);
++        });
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
++        fs.insert_tree("/other", json!({ "file.txt": "" })).await;
++
++        async fn add_panel(
++            fs: Arc<FakeFs>,
++            root: &str,
++            connection: StubAgentConnection,
++            cx: &mut TestAppContext,
++        ) -> (Entity<AgentPanel>, VisualTestContext) {
++            let project = Project::test(fs, [Path::new(root)], cx).await;
++            let multi_workspace =
++                cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++            let workspace = multi_workspace
++                .read_with(cx, |multi_workspace, _cx| {
++                    multi_workspace.workspace().clone()
++                })
++                .unwrap();
++            workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
++            let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
++            let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
++                let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
++                workspace.add_panel(panel.clone(), window, cx);
++                panel
++            });
++            panel.update(&mut cx, |panel, cx| {
++                panel.connection_store.update(cx, |store, cx| {
++                    store.restart_connection(
++                        Agent::Stub,
++                        Rc::new(StubAgentServer::new(connection)),
++                        cx,
++                    );
++                });
++            });
++            cx.run_until_parked();
++            (panel, cx)
++        }
++
++        // Loadable, as the adapters that produce these links are: reopening in a
++        // panel that never held the session goes through `load_session`.
++        let connection = StubAgentConnection::new().with_supports_load_session(true);
++
++        let (panel, mut project_cx) =
++            add_panel(fs.clone(), "/project", connection.clone(), cx).await;
++        panel.update_in(&mut project_cx, |panel, window, cx| {
++            panel.selected_agent = Agent::Stub;
++            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
++        });
++        project_cx.run_until_parked();
++        crate::test_support::send_message(&panel, &mut project_cx);
++        let thread_id = crate::test_support::active_thread_id(&panel, &project_cx);
++        let session_id = crate::test_support::active_session_id(&panel, &project_cx);
++        project_cx.run_until_parked();
++
++        let (other_panel, mut other_cx) = add_panel(fs.clone(), "/other", connection, cx).await;
++        other_panel.update_in(&mut other_cx, |panel, window, cx| {
++            panel.open_thread_by_session(session_id.clone(), window, cx);
++        });
++        other_cx.run_until_parked();
++
++        other_panel.read_with(&other_cx, |panel, cx| {
++            assert_eq!(panel.active_thread_id(cx), Some(thread_id));
++            let view = panel
++                .active_conversation_view()
++                .expect("the session should be open in the other panel");
++            assert_eq!(view.read(cx).agent_key(), &Agent::Stub);
++            let connected = view
++                .read(cx)
++                .as_connected()
++                .expect("the session's agent should be connected");
++            assert!(
++                !connected.has_thread_error(cx),
++                "the session should load without an error"
++            );
++        });
++
++        let folders = other_cx.update(|_, cx| {
++            ThreadMetadataStore::global(cx)
++                .read(cx)
++                .entry_by_session(&session_id)
++                .map(|metadata| metadata.folder_paths().paths().to_vec())
++        });
++        assert_eq!(folders, Some(vec![PathBuf::from("/project")]));
++    }
++
+     #[gpui::test]
+     async fn test_new_draft_survives_reload_when_real_thread_is_active(cx: &mut TestAppContext) {
+         init_test(cx);
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index f720fef..9813a42 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -1037,29 +1037,78 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut
+             }
+             OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                session_id,
++                cwd,
+             } => {
+                 cx.spawn(async move |cx| {
+-                    let multi_workspace =
+-                        workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
++                    // A thread belongs to a project, so a session is opened in the
++                    // window holding that project -- found across every window, or
++                    // opened the way `zed <folder>` would -- and not in whichever
++                    // window has focus. On a machine with one window per project
++                    // on separate virtual desktops, the focused window is the one
++                    // on the desktop the click came from, which says nothing about
++                    // the thread.
++                    let session_folders = match &session_id {
++                        Some(session_id) => agent_session_folders(session_id, cwd, cx).await,
++                        None => None,
++                    };
++                    let (multi_workspace, workspace) = match session_folders {
++                        Some(folders) => {
++                            let opened = cx
++                                .update(|cx| {
++                                    workspace::open_paths(
++                                        &folders,
++                                        app_state,
++                                        workspace::OpenOptions::default(),
++                                        cx,
++                                    )
++                                })
++                                .await?;
++                            (opened.window, opened.workspace)
++                        }
++                        None => {
++                            let multi_workspace =
++                                workspace::get_any_active_multi_workspace(app_state, cx.clone())
++                                    .await?;
++                            let workspace = multi_workspace
++                                .read_with(cx, |multi_workspace, _| {
++                                    multi_workspace.workspace().clone()
++                                })?;
++                            (multi_workspace, workspace)
++                        }
++                    };
+ 
+-                    let panels_task = multi_workspace.update(cx, |multi_workspace, _, cx| {
+-                        multi_workspace
+-                            .workspace()
+-                            .update(cx, |workspace, _| workspace.take_panels_task())
+-                    })?;
++                    let panels_task =
++                        workspace.update(cx, |workspace, _| workspace.take_panels_task());
+                     if let Some(task) = panels_task {
+                         task.await.log_err();
+                     }
+ 
+-                    multi_workspace.update(cx, |multi_workspace, window, cx| {
+-                        multi_workspace.workspace().update(cx, |workspace, cx| {
++                    multi_workspace.update(cx, |_, window, cx| {
++                        // Raise the window before touching the panel. Focusing a
++                        // panel only moves focus *inside* Zed: on a desktop with
++                        // virtual workspaces the window stays where it is, on
++                        // whichever desktop it was left, and the link looks like it
++                        // did nothing. `activate_window` is what asks the window
++                        // manager to bring it forward -- the same call
++                        // `activate_any_workspace_window` makes for zed://open.
++                        window.activate_window();
++
++                        workspace.update(cx, |workspace, cx| {
+                             if let Some(panel) = workspace.focus_panel::<AgentPanel>(window, cx) {
+                                 panel.update(cx, |panel, cx| {
+-                                    panel.new_agent_thread_with_external_source_prompt(
+-                                        external_source_prompt,
+-                                        window,
+-                                        cx,
+-                                    );
++                                    // A session id reopens that thread, with the
++                                    // agent that owns it; everything else starts a
++                                    // new one.
++                                    if let Some(session_id) = session_id {
++                                        panel.open_thread_by_session(session_id, window, cx);
++                                    } else {
++                                        panel.new_agent_thread_with_external_source_prompt(
++                                            external_source_prompt,
++                                            window,
++                                            cx,
++                                        );
++                                    }
+                                 });
+                             } else {
+                                 log::warn!(
+@@ -1368,6 +1417,38 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut
+     }
+ }
+ 
++/// The folders the thread of an agent session belongs to.
++///
++/// The session's metadata row is the authority: it records the folders the
++/// thread was started in. `cwd` -- what the link's producer saw -- only answers
++/// for a session no row knows yet. `None` leaves the choice to the focused
++/// window, which is also what a thread on a remote host gets: its folders name
++/// paths on that host, not on this one.
++async fn agent_session_folders(
++    session_id: &agent_client_protocol::schema::v1::SessionId,
++    cwd: Option<PathBuf>,
++    cx: &mut AsyncApp,
++) -> Option<Vec<PathBuf>> {
++    let store =
++        cx.update(|cx| agent_ui::thread_metadata_store::ThreadMetadataStore::try_global(cx));
++    let Some(store) = store else {
++        return cwd.map(|cwd| vec![cwd]);
++    };
++    // The store loads its rows from disk at startup, and a link that launched
++    // Zed arrives before that finishes; without the wait it finds no row and
++    // falls through to `cwd` for a thread it does know.
++    let reload = store.read_with(cx, |store, _| store.reload_task());
++    reload.await;
++
++    store.read_with(cx, |store, _| match store.entry_by_session(session_id) {
++        Some(metadata) if metadata.remote_connection.is_some() => None,
++        Some(metadata) => Some(metadata.folder_paths().paths().to_vec())
++            .filter(|folders| !folders.is_empty())
++            .or_else(|| cwd.map(|cwd| vec![cwd])),
++        None => cwd.map(|cwd| vec![cwd]),
++    })
++}
++
+ async fn authenticate(client: Arc<Client>, cx: &AsyncApp) -> Result<()> {
+     if stdout_is_a_pty() {
+         if client::IMPERSONATE_LOGIN.is_some() {
+diff --git a/crates/zed/src/zed/open_listener.rs b/crates/zed/src/zed/open_listener.rs
+index 0675fdd..2083b10 100644
+--- a/crates/zed/src/zed/open_listener.rs
++++ b/crates/zed/src/zed/open_listener.rs
+@@ -1,5 +1,6 @@
+ use crate::handle_open_request;
+ use crate::restore_or_create_workspace;
++use agent_client_protocol::schema::v1 as acp;
+ use agent_ui::ExternalSourcePrompt;
+ use anyhow::{Context as _, Result, anyhow};
+ use cli::{CliRequest, CliResponse, CliResponseSink};
+@@ -59,6 +60,21 @@ pub enum OpenRequestKind {
+     },
+     AgentPanel {
+         external_source_prompt: Option<ExternalSourcePrompt>,
++        /// Open this existing thread instead of starting a new one.
++        ///
++        /// The id is the agent session id, which is what `AgentPanel::open_thread`
++        /// already resolves against `ThreadMetadataStore`. It is deliberately the
++        /// same identifier the agent itself uses, so whatever produced the link --
++        /// a share link, a shell script, a notification -- does not have to know
++        /// anything about Zed's local thread ids.
++        session_id: Option<acp::SessionId>,
++        /// The directory the session runs in, as the producer of the link saw it.
++        ///
++        /// Only a fallback for choosing the window: a thread this machine already
++        /// has a metadata row for is routed by the folders on that row. It exists
++        /// for the session the row does not know yet -- and absolute paths only,
++        /// since a relative one would resolve against wherever Zed was started.
++        cwd: Option<PathBuf>,
+     },
+     InstallSkill {
+         /// Full `SKILL.md` contents embedded in a `zed://skill` share link.
+@@ -93,9 +109,13 @@ impl std::fmt::Debug for OpenRequestKind {
+                 .finish(),
+             Self::AgentPanel {
+                 external_source_prompt,
++                session_id,
++                cwd,
+             } => f
+                 .debug_struct("AgentPanel")
+                 .field("external_source_prompt", external_source_prompt)
++                .field("session_id", session_id)
++                .field("cwd", cwd)
+                 .finish(),
+             Self::InstallSkill { content } => f
+                 .debug_struct("InstallSkill")
+@@ -221,15 +241,45 @@ impl OpenRequest {
+     }
+ 
+     fn parse_agent_url(&mut self, agent_path: &str) {
+-        // Format: "" or "?prompt=<text>".
++        // Format: "", "?prompt=<text>" or "?session=<id>[&cwd=<abs path>]".
++        //
++        // The two are mutually exclusive in practice and `session` wins: a link
++        // that names an existing thread is asking for that thread, and seeding a
++        // prompt into it would put words in a conversation the user did not
++        // reopen to extend.
+         let agent_path = agent_path.strip_prefix('/').unwrap_or(agent_path);
+-        let external_source_prompt = agent_path.strip_prefix('?').and_then(|query| {
+-            url::form_urlencoded::parse(query.as_bytes())
+-                .find_map(|(key, value)| (key == "prompt").then_some(value))
+-                .and_then(|prompt| ExternalSourcePrompt::new(prompt.as_ref()))
++        let query = agent_path.strip_prefix('?');
++
++        let session_id = query.and_then(|query| {
++            url::form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
++                (key == "session" && !value.trim().is_empty())
++                    .then(|| acp::SessionId::new(value.trim()))
++            })
+         });
++
++        let external_source_prompt = session_id
++            .is_none()
++            .then(|| {
++                query.and_then(|query| {
++                    url::form_urlencoded::parse(query.as_bytes())
++                        .find_map(|(key, value)| (key == "prompt").then_some(value))
++                        .and_then(|prompt| ExternalSourcePrompt::new(prompt.as_ref()))
++                })
++            })
++            .flatten();
++
++        let cwd = query.and_then(|query| {
++            url::form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
++                (key == "cwd")
++                    .then(|| PathBuf::from(value.as_ref()))
++                    .filter(|path| path.is_absolute())
++            })
++        });
++
+         self.kind = Some(OpenRequestKind::AgentPanel {
+             external_source_prompt,
++            session_id,
++            cwd,
+         });
+     }
+ 
+@@ -1487,6 +1537,7 @@ mod tests {
+         match request.kind {
+             Some(OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                ..
+             }) => {
+                 assert_eq!(external_source_prompt, None);
+             }
+@@ -1565,6 +1616,7 @@ mod tests {
+         match request.kind {
+             Some(OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                ..
+             }) => {
+                 assert_eq!(
+                     external_source_prompt
+@@ -1595,6 +1647,7 @@ mod tests {
+         match request.kind {
+             Some(OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                ..
+             }) => {
+                 assert_eq!(
+                     external_source_prompt
+@@ -1652,13 +1705,152 @@ mod tests {
+         match request.kind {
+             Some(OpenRequestKind::AgentPanel {
+                 external_source_prompt,
++                ..
++            }) => {
++                assert_eq!(external_source_prompt, None);
++            }
++            _ => panic!("Expected AgentPanel kind"),
++        }
++    }
++
++    #[gpui::test]
++    fn test_parse_agent_url_with_session(cx: &mut TestAppContext) {
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec!["zed://agent?session=abc-123".into()],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++
++        match request.kind {
++            Some(OpenRequestKind::AgentPanel {
++                session_id,
++                external_source_prompt,
++                ..
+             }) => {
++                assert_eq!(session_id.as_ref().map(|id| id.0.as_ref()), Some("abc-123"));
+                 assert_eq!(external_source_prompt, None);
+             }
+             _ => panic!("Expected AgentPanel kind"),
+         }
+     }
+ 
++    /// A link that names a thread is asking for that thread. Seeding a prompt
++    /// into it would put words into a conversation the user reopened to read.
++    #[gpui::test]
++    fn test_parse_agent_url_session_wins_over_prompt(cx: &mut TestAppContext) {
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec!["zed://agent?session=abc-123&prompt=hello".into()],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++
++        match request.kind {
++            Some(OpenRequestKind::AgentPanel {
++                session_id,
++                external_source_prompt,
++                ..
++            }) => {
++                assert_eq!(session_id.as_ref().map(|id| id.0.as_ref()), Some("abc-123"));
++                assert_eq!(external_source_prompt, None);
++            }
++            _ => panic!("Expected AgentPanel kind"),
++        }
++    }
++
++    /// An empty value is not a session: it would resolve to no thread and
++    /// silently swallow a prompt that was also supplied.
++    #[gpui::test]
++    fn test_parse_agent_url_with_empty_session(cx: &mut TestAppContext) {
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec!["zed://agent?session=&prompt=hello".into()],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++
++        match request.kind {
++            Some(OpenRequestKind::AgentPanel {
++                session_id,
++                external_source_prompt,
++                ..
++            }) => {
++                assert_eq!(session_id, None);
++                assert_eq!(
++                    external_source_prompt
++                        .as_ref()
++                        .map(ExternalSourcePrompt::as_str),
++                    Some("hello")
++                );
++            }
++            _ => panic!("Expected AgentPanel kind"),
++        }
++    }
++
++    /// The directory rides along with the session, percent-decoded, so the
++    /// handler can pick the window a thread belongs to when no metadata row
++    /// knows the session yet.
++    #[gpui::test]
++    fn test_parse_agent_url_with_session_and_cwd(cx: &mut TestAppContext) {
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec![
++                        "zed://agent?session=abc-123&cwd=%2Fhome%2Fme%2Fmy%20project".into(),
++                    ],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++
++        match request.kind {
++            Some(OpenRequestKind::AgentPanel {
++                session_id, cwd, ..
++            }) => {
++                assert_eq!(session_id.as_ref().map(|id| id.0.as_ref()), Some("abc-123"));
++                assert_eq!(cwd, Some(PathBuf::from("/home/me/my project")));
++            }
++            _ => panic!("Expected AgentPanel kind"),
++        }
++    }
++
++    /// A relative directory would resolve against wherever Zed happened to be
++    /// started, which is not where the session runs. It is dropped rather than
++    /// guessed at.
++    #[gpui::test]
++    fn test_parse_agent_url_ignores_relative_cwd(cx: &mut TestAppContext) {
++        let request = cx.update(|cx| {
++            OpenRequest::parse(
++                RawOpenRequest {
++                    urls: vec!["zed://agent?session=abc-123&cwd=my-project".into()],
++                    ..Default::default()
++                },
++                cx,
++            )
++            .unwrap()
++        });
++
++        match request.kind {
++            Some(OpenRequestKind::AgentPanel { cwd, .. }) => assert_eq!(cwd, None),
++            _ => panic!("Expected AgentPanel kind"),
++        }
++    }
++
+     #[gpui::test]
+     fn test_parse_git_commit_url(cx: &mut TestAppContext) {
+         let _app_state = init_test(cx);

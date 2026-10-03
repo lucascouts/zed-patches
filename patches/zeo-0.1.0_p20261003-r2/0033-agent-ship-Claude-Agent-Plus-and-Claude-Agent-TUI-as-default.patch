@@ -1,0 +1,267 @@
+From 07cd46b401ba51f352a171ddf4e2602894447532 Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@protonmail.com>
+Date: Sat, 3 Oct 2026 18:00:54 -0300
+Subject: [PATCH] agent: ship Claude Agent (Plus) and Claude Agent TUI as
+ default agents
+
+Zeo exists to carry the Claude agent adapters, yet a fresh install offered
+neither: an agent appears in the thread menu only through an `agent_servers`
+entry, and Zeo's defaults had none. Every Gentoo user had to write those
+entries by hand, and the Flatpak -- which keeps its own settings under
+~/.var/app/dev.zeo.Zeo -- started without them even on a machine whose native
+Zeo had them. Found on 2026-10-03 testing the Flatpak.
+
+Zed already has the mechanism for agents that need no setup: the ACP registry.
+A registry entry names an npm package; on first use Zed installs it with its
+own Node runtime into external_agents_dir/registry/npx/<id> and launches its
+bin. That is how claude-acp works out of the box. The adapters are on npm, so
+this uses the same path rather than a new one:
+
+  agent_registry_store.rs adds two npx entries, claude-agent-acp-plus and
+  claude-agent-tui, to whatever the registry returned -- and to an empty
+  list, so they exist before the first fetch and offline. A registry entry
+  with the same id wins over Zeo's.
+
+  default.json enables both as `{ "type": "registry" }` under agent_servers,
+  so they are thread options with no configuration. User settings merge on
+  top, as for any default.
+
+The packages are `@lucascouts/...@latest`, by decision: every launch runs
+`npm install <package>@latest`, so the adapters track the newest published
+version without a Zeo rebuild. bounded_npm_package_spec already leaves a
+non-semver tag alone, so the spec reaches npm unchanged. The trade is that no
+release-age cooldown applies to these two packages.
+
+Claude Agent TUI runs the real `claude` CLI in a terminal, so it still needs
+that CLI on the system; its description says so. Claude Agent (Plus) bundles
+its CLI and needs nothing.
+
+Tests: the two entries exist with no registry, a registry entry with the same
+id is kept instead of duplicated, `@latest` reaches npm intact, and
+SettingsStore::test reports both enabled as registry agents.
+---
+
+diff --git a/assets/settings/default.json b/assets/settings/default.json
+index f0fd52f..5843217 100644
+--- a/assets/settings/default.json
++++ b/assets/settings/default.json
+@@ -2986,7 +2986,15 @@
+   // Configures context servers for use by the agent.
+   "context_servers": {},
+   // Configures agent servers available in the agent panel.
+-  "agent_servers": {},
++  //
++  // Zeo enables its two Claude adapters by default. Both are installed on first
++  // use from npm (always the latest published version) with Zeo's own Node
++  // runtime, so nothing has to be installed beforehand. Claude Agent TUI also
++  // needs the `claude` CLI on the system.
++  "agent_servers": {
++    "claude-agent-acp-plus": { "type": "registry" },
++    "claude-agent-tui": { "type": "registry" },
++  },
+   "debugger": {
+     "stepping_granularity": "line",
+     "save_breakpoints": true,
+diff --git a/crates/project/src/agent_registry_store.rs b/crates/project/src/agent_registry_store.rs
+index 7ab885d..8237574 100644
+--- a/crates/project/src/agent_registry_store.rs
++++ b/crates/project/src/agent_registry_store.rs
+@@ -248,7 +248,7 @@ impl AgentRegistryStore {
+                 this.is_fetching = false;
+                 match result {
+                     Ok(agents) => {
+-                        this.agents = agents;
++                        this.agents = with_zeo_agents(agents);
+                         this.fetch_error = None;
+                     }
+                     Err(error) => {
+@@ -281,7 +281,7 @@ impl AgentRegistryStore {
+         let mut store = Self {
+             fs: fs.clone(),
+             http_client,
+-            agents: Vec::new(),
++            agents: with_zeo_agents(Vec::new()),
+             is_fetching: false,
+             fetch_error: None,
+             pending_refresh: None,
+@@ -321,7 +321,7 @@ impl AgentRegistryStore {
+                 build_registry_agents(fs, http_client, index, bytes, false, &executor).await?;
+ 
+             this.update(cx, |this, cx| {
+-                this.agents = agents;
++                this.agents = with_zeo_agents(agents);
+                 cx.notify();
+             })?;
+ 
+@@ -331,6 +331,64 @@ impl AgentRegistryStore {
+     }
+ }
+ 
++/// The two Claude adapters Zeo ships with, as npx registry agents.
++///
++/// They are not in the public ACP registry, so Zeo adds them to whatever the
++/// registry returned -- and to an empty list, so they exist before the first
++/// fetch and with no network at all. `@latest` makes every launch run
++/// `npm install <package>@latest`, which is how they track the newest
++/// published adapter without a Zeo rebuild (`bounded_npm_package_spec` leaves a
++/// non-semver tag alone). assets/settings/default.json enables both.
++pub const ZEO_PLUS_AGENT_ID: &str = "claude-agent-acp-plus";
++pub const ZEO_TUI_AGENT_ID: &str = "claude-agent-tui";
++
++fn zeo_agents() -> Vec<RegistryAgent> {
++    let agent = |id: &str, name: &str, description: &str, package: &str, repository: &str| {
++        RegistryAgent::Npx(RegistryNpxAgent {
++            metadata: RegistryAgentMetadata {
++                id: AgentId(id.to_string().into()),
++                name: name.to_string().into(),
++                description: description.to_string().into(),
++                version: "latest".into(),
++                repository: Some(repository.to_string().into()),
++                website: None,
++                license_url: None,
++                icon_path: None,
++            },
++            package: format!("{package}@latest").into(),
++            args: Vec::new(),
++            env: HashMap::default(),
++        })
++    };
++    vec![
++        agent(
++            ZEO_PLUS_AGENT_ID,
++            "Claude Agent (Plus)",
++            "Claude Code over ACP, with Zeo's agent-panel integration",
++            "@lucascouts/claude-agent-acp-plus",
++            "https://github.com/zeo-workspace/claude-agent-acp-plus",
++        ),
++        agent(
++            ZEO_TUI_AGENT_ID,
++            "Claude Agent TUI",
++            "The Claude Code terminal UI in the agent panel (needs the claude CLI installed)",
++            "@lucascouts/claude-agent-tui",
++            "https://github.com/zeo-workspace/claude-agent-tui",
++        ),
++    ]
++}
++
++/// `agents` plus Zeo's own, unless the registry already lists an agent with the
++/// same id -- the registry's entry then wins.
++fn with_zeo_agents(mut agents: Vec<RegistryAgent>) -> Vec<RegistryAgent> {
++    for zeo_agent in zeo_agents() {
++        if !agents.iter().any(|agent| agent.id() == zeo_agent.id()) {
++            agents.push(zeo_agent);
++        }
++    }
++    agents
++}
++
+ struct RegistryFetchResult {
+     index: RegistryIndex,
+     raw_body: Vec<u8>,
+@@ -683,3 +741,57 @@ struct RegistryNpxDistribution {
+     #[serde(default)]
+     env: HashMap<String, String>,
+ }
++
++#[cfg(test)]
++mod zeo_agent_tests {
++    use super::*;
++
++    fn npx(id: &str, package: &str) -> RegistryAgent {
++        RegistryAgent::Npx(RegistryNpxAgent {
++            metadata: RegistryAgentMetadata {
++                id: AgentId(id.to_string().into()),
++                name: id.to_string().into(),
++                description: "".into(),
++                version: "1.0.0".into(),
++                repository: None,
++                website: None,
++                license_url: None,
++                icon_path: None,
++            },
++            package: package.to_string().into(),
++            args: Vec::new(),
++            env: HashMap::default(),
++        })
++    }
++
++    /// With no registry at all -- first start, offline -- both adapters exist.
++    #[test]
++    fn zeo_agents_exist_without_a_registry() {
++        let agents = with_zeo_agents(Vec::new());
++        let ids: Vec<&str> = agents.iter().map(|agent| agent.id().0.as_ref()).collect();
++        assert_eq!(ids, vec![ZEO_PLUS_AGENT_ID, ZEO_TUI_AGENT_ID]);
++        for agent in &agents {
++            let RegistryAgent::Npx(agent) = agent else {
++                panic!("{} should be an npx agent", agent.id().0);
++            };
++            assert!(agent.package.ends_with("@latest"), "{}", agent.package);
++            assert!(agent.package.starts_with("@lucascouts/"), "{}", agent.package);
++        }
++    }
++
++    /// The public registry's entries are kept, and one that already uses a Zeo
++    /// id wins over Zeo's built-in instead of being duplicated.
++    #[test]
++    fn registry_entries_are_kept_and_win_on_the_same_id() {
++        let agents = with_zeo_agents(vec![
++            npx("claude-acp", "@agentclientprotocol/claude-agent-acp@1.0.0"),
++            npx(ZEO_PLUS_AGENT_ID, "registry-provided@1.0.0"),
++        ]);
++        let ids: Vec<&str> = agents.iter().map(|agent| agent.id().0.as_ref()).collect();
++        assert_eq!(ids, vec!["claude-acp", ZEO_PLUS_AGENT_ID, ZEO_TUI_AGENT_ID]);
++        let RegistryAgent::Npx(plus) = &agents[1] else {
++            panic!("plus should be an npx agent");
++        };
++        assert_eq!(plus.package.as_ref(), "registry-provided@1.0.0");
++    }
++}
+diff --git a/crates/project/src/agent_server_store.rs b/crates/project/src/agent_server_store.rs
+index 8b10f8b..efe255c 100644
+--- a/crates/project/src/agent_server_store.rs
++++ b/crates/project/src/agent_server_store.rs
+@@ -1835,6 +1835,44 @@ mod tests {
+         })
+     }
+ 
++    /// Zeo's adapters reach `npm install` as `<package>@latest`, so every launch
++    /// resolves the newest published version.
++    #[test]
++    fn zeo_agent_packages_install_latest() {
++        assert_eq!(
++            bounded_npm_package_spec("@lucascouts/claude-agent-acp-plus@latest"),
++            (
++                "@lucascouts/claude-agent-acp-plus",
++                "@lucascouts/claude-agent-acp-plus@latest".to_string()
++            )
++        );
++    }
++
++    /// Zeo's default settings enable both adapters as registry agents, so they
++    /// are thread options with no user configuration.
++    #[gpui::test]
++    fn zeo_agents_are_enabled_by_default(cx: &mut TestAppContext) {
++        init_test_settings(cx);
++        cx.update(|cx| {
++            let settings = cx
++                .global::<SettingsStore>()
++                .get::<AllAgentServersSettings>(None)
++                .clone();
++            for id in [
++                crate::agent_registry_store::ZEO_PLUS_AGENT_ID,
++                crate::agent_registry_store::ZEO_TUI_AGENT_ID,
++            ] {
++                assert!(
++                    matches!(
++                        settings.get(id),
++                        Some(CustomAgentServerSettings::Registry { .. })
++                    ),
++                    "{id} should be enabled as a registry agent by default"
++                );
++            }
++        });
++    }
++
+     #[test]
+     fn builds_bounded_npm_package_specs() {
+         assert_eq!(
