@@ -1,0 +1,93 @@
+From 67c1835beadfa819d280d8727983b510c67cc40f Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@protonmail.com>
+Date: Sat, 3 Oct 2026 14:07:40 -0300
+Subject: [PATCH] cli: let the Flatpak escape recognise Zeo's app id and
+ binaries
+
+Zed's Flatpak does not run sandboxed. The CLI notices FLATPAK_ID, asks the
+host for the installation directory, and re-executes itself outside the
+sandbox through `flatpak-spawn --host`, pointing the editor at the
+Flatpak's own files with ZED_FLATPAK_LIB_PATH. That is what gives the
+terminal, language servers and agents (the Claude Code integration among
+them) the host's tools.
+
+Every name in that path was Zed's: the escape only fires when FLATPAK_ID
+starts with "dev.zed.Zed", it re-executes `bin/zed`, and it falls back to
+`/app/libexec/zed-editor`. Zeo ships as `dev.zeo.Zeo`, with `zeo` and
+`zeo-editor`, so under Flatpak the escape silently never happened and the
+editor ran confined to the runtime -- the opposite of the permissions the
+package asks for.
+
+This keeps the mechanism and swaps the names: the app-id prefix, the two
+binaries, and the "update with flatpak" message. The ZED_FLATPAK_* variable
+names are internal plumbing between the CLI and itself and stay as they
+are. Outside a Flatpak nothing here runs, so the change is inert for the
+Gentoo packages; it exists for the dev.zeo.Zeo Flatpak bundle.
+
+test_restart_cli_args, updated to the new editor path, passes.
+---
+
+diff --git a/crates/cli/src/main.rs b/crates/cli/src/main.rs
+index a5d314f..3b38aac 100644
+--- a/crates/cli/src/main.rs
++++ b/crates/cli/src/main.rs
+@@ -1049,7 +1049,7 @@ mod flatpak {
+         if !invocation_args.iter().any(|arg| arg == "--zed") {
+             // Positional paths consume all following arguments, so launcher options must precede them.
+             args.push("--zed".into());
+-            args.push(flatpak_dir.join("libexec").join("zed-editor").into());
++            args.push(flatpak_dir.join("libexec").join("zeo-editor").into());
+         }
+ 
+         args.extend_from_slice(invocation_args);
+@@ -1076,7 +1076,7 @@ mod flatpak {
+         if let Some(flatpak_dir) = get_flatpak_dir() {
+             let mut args = vec!["/usr/bin/flatpak-spawn".into(), "--host".into()];
+             args.append(&mut get_xdg_env_args());
+-            args.push("--env=ZED_UPDATE_EXPLANATION=Please use flatpak to update zed".into());
++            args.push("--env=ZED_UPDATE_EXPLANATION=Please use flatpak to update Zeo".into());
+             args.push(
+                 format!(
+                     "--env={EXTRA_LIB_ENV_NAME}={}",
+@@ -1084,7 +1084,7 @@ mod flatpak {
+                 )
+                 .into(),
+             );
+-            args.push(flatpak_dir.join("bin").join("zed").into());
++            args.push(flatpak_dir.join("bin").join("zeo").into());
+ 
+             let invocation_args = env::args_os().skip(1).collect::<Vec<_>>();
+             args.extend(restart_cli_args(&flatpak_dir, &invocation_args));
+@@ -1097,11 +1097,11 @@ mod flatpak {
+ 
+     pub fn set_bin_if_no_escape(mut args: super::Args) -> super::Args {
+         if env::var(NO_ESCAPE_ENV_NAME).is_ok()
+-            && env::var("FLATPAK_ID").is_ok_and(|id| id.starts_with("dev.zed.Zed"))
++            && env::var("FLATPAK_ID").is_ok_and(|id| id.starts_with("dev.zeo.Zeo"))
+             && args.zed.is_none()
+         {
+-            args.zed = Some("/app/libexec/zed-editor".into());
+-            unsafe { env::set_var("ZED_UPDATE_EXPLANATION", "Please use flatpak to update zed") };
++            args.zed = Some("/app/libexec/zeo-editor".into());
++            unsafe { env::set_var("ZED_UPDATE_EXPLANATION", "Please use flatpak to update Zeo") };
+         }
+         args
+     }
+@@ -1112,7 +1112,7 @@ mod flatpak {
+         }
+ 
+         if let Ok(flatpak_id) = env::var("FLATPAK_ID") {
+-            if !flatpak_id.starts_with("dev.zed.Zed") {
++            if !flatpak_id.starts_with("dev.zeo.Zeo") {
+                 return None;
+             }
+ 
+@@ -1158,7 +1158,7 @@ mod flatpak {
+                 crate::Args::try_parse_from(std::iter::once(OsString::from("zed")).chain(args))
+                     .unwrap();
+ 
+-            assert_eq!(parsed.zed, Some(flatpak_dir.join("libexec/zed-editor")));
++            assert_eq!(parsed.zed, Some(flatpak_dir.join("libexec/zeo-editor")));
+             assert_eq!(parsed.paths_with_position, ["project"]);
+ 
+             let invocation_args = ["--zed".into(), "/custom/zed-editor".into()];

@@ -1,0 +1,483 @@
+From 1d1f34692313057a089ff4a37270b9822786820f Mon Sep 17 00:00:00 2001
+From: lucascouts <lucascs@protonmail.com>
+Date: Sun, 27 Sep 2026 00:52:14 -0300
+Subject: [PATCH] sidebar: show a thread whose turn ended with background work
+ still running
+
+The sidebar's thread icon only knew two live states: a turn in flight (the
+grey spinner) and everything else. Claude Code runs work that outlives the
+turn that launched it -- a `run_in_background` shell, an async subagent, a
+monitor -- and once the prompt returns ACP has nothing to say about it:
+AcpThread::status() is `running_turn.is_some()`, so the row went back to the
+agent's plain icon while the work carried on, and only a later follow-up turn
+brought the spinner back.
+
+The adapter already tracked this. claude-agent-acp-plus consumes the SDK's
+`background_tasks_changed` level to decide when a turn may settle; it now
+forwards the same level, filtered of the tasks the SDK marks `ambient` ("not
+activity"), as `session_info_update._meta["_claude/backgroundTasks"]` =
+`{ count, tasks: [{ id, type, description }] }`, and only when the set
+changes. Measured over ACP stdio against the real CLI on 2026-09-27: the
+prompt answered at 4.9 s, `count: 1` had arrived at 3.9 s, and `count: 0`
+arrived at 23.9 s -- outside any turn, which is the case this patch exists for.
+
+What this adds:
+
+- AcpThread reads the count off `session_info_update` and emits
+  `BackgroundTasksUpdated` when it changes. An update without the key leaves
+  the count alone: the adapter's title-only updates ride the same
+  notification, and reading their silence as "none left" would clear it.
+- `AgentThreadStatus::Background`, chosen when the turn is idle and the count
+  is non-zero. It ranks below waiting-for-confirmation and error, exactly as
+  Running does, so an alert is never hidden behind it.
+- The icon is the same LoadCircle as a running turn, tinted Accent and turning
+  at half the speed, so it still reads as "working" but the two stay apart.
+  A tooltip names it: "Running in the Background".
+- The "finished while you were away" dot now also fires on
+  Background -> Completed, so the end of the last background task is news the
+  way the end of a turn is.
+
+What it deliberately does not do:
+
+- It routes nothing through ThreadMetadataStore. The first draft marked the
+  event as `affects_thread_metadata`, on the theory that the store was the only
+  path to the sidebar; a mutation test showed the sidebar refreshed without
+  it. Every thread event ends in `cx.notify()` on the ConversationView, and the
+  agent panel observes every conversation view -- active or not -- and asks
+  the sidebar to rebuild. The metadata route would have rewritten `updated_at`
+  in the database twice per background task for nothing.
+- Stop and archive treat Background like Completed. "Stop Generation" cancels
+  a turn, and there is no turn to cancel; offering it would promise to kill
+  work it cannot reach.
+- The collapsed project header's spinner is unchanged: it still means a turn
+  is running.
+
+No other agent sends the key, so for them nothing changes. Rides the
+claude-agent-acp-plus flag BY DEPENDENCY, like 0011 and 0013.
+---
+
+diff --git a/crates/acp_thread/src/acp_thread.rs b/crates/acp_thread/src/acp_thread.rs
+index 8f89356..e9612b9 100644
+--- a/crates/acp_thread/src/acp_thread.rs
++++ b/crates/acp_thread/src/acp_thread.rs
+@@ -3562,6 +3562,15 @@ impl AccountUsage {
+ /// forwards the SDK's `rate_limit_event` here instead of dropping it.
+ const CLAUDE_RATE_LIMIT_META_KEY: &str = "_claude/rateLimit";
+ 
++/// The `_meta` key the ACP adapter writes the live background-task set under, on a
++/// `session_info_update`.
++///
++/// ACP has no notion of work that outlives a turn: once the prompt returns, the thread is
++/// idle as far as the protocol can say, while a `run_in_background` shell or an async
++/// subagent keeps running. `claude-agent-acp-plus` forwards the SDK's
++/// `background_tasks_changed` level here, as `{ "count": n, "tasks": [...] }`.
++const CLAUDE_BACKGROUND_TASKS_META_KEY: &str = "_claude/backgroundTasks";
++
+ pub const TOKEN_USAGE_WARNING_THRESHOLD: f32 = 0.8;
+ 
+ impl TokenUsage {
+@@ -3661,6 +3670,7 @@ pub struct AcpThread {
+     activity: SessionActivity,
+     token_usage: Option<TokenUsage>,
+     account_usage: AccountUsage,
++    background_task_count: usize,
+     cost: Option<SessionCost>,
+     prompt_capabilities: acp_v1::PromptCapabilities,
+     available_commands: Vec<acp_v1::AvailableCommand>,
+@@ -3786,6 +3796,7 @@ pub enum AcpThreadEvent {
+     NoticesUpdated,
+     TokenUsageUpdated,
+     AccountUsageUpdated,
++    BackgroundTasksUpdated,
+     EntryUpdated(usize),
+     EntriesRemoved(Range<usize>),
+     ToolAuthorizationRequested(PermissionRequestId),
+@@ -3937,6 +3948,7 @@ impl AcpThread {
+                 | AcpThreadEvent::NoticesUpdated
+                 | AcpThreadEvent::TokenUsageUpdated
+                 | AcpThreadEvent::AccountUsageUpdated
++                | AcpThreadEvent::BackgroundTasksUpdated
+                 | AcpThreadEvent::EntryUpdated(_)
+                 | AcpThreadEvent::Retry(_)
+                 | AcpThreadEvent::SubagentSpawned(_)
+@@ -3992,6 +4004,7 @@ impl AcpThread {
+             session_id,
+             token_usage: None,
+             account_usage: AccountUsage::default(),
++            background_task_count: 0,
+             cost: None,
+             prompt_capabilities,
+             available_commands: Vec::new(),
+@@ -4412,6 +4425,12 @@ impl AcpThread {
+         (!self.account_usage.is_empty()).then_some(&self.account_usage)
+     }
+ 
++    /// How many tasks the agent reports running in the background — work that outlives
++    /// the turn that launched it, so [`Self::status`] reads `Idle` while it runs.
++    pub fn background_task_count(&self) -> usize {
++        self.background_task_count
++    }
++
+     pub fn cost(&self) -> Option<&SessionCost> {
+         self.cost.as_ref()
+     }
+@@ -4587,6 +4606,22 @@ impl AcpThread {
+                         cx.emit(AcpThreadEvent::TitleUpdated);
+                     }
+                 }
++                // Absent for every agent but the Claude adapter, and absent from its own
++                // title-only updates too, so a missing key leaves the count alone rather
++                // than resetting it.
++                let background_task_count = info_update
++                    .meta
++                    .as_ref()
++                    .and_then(|meta| meta.get(CLAUDE_BACKGROUND_TASKS_META_KEY))
++                    .and_then(|payload| payload.get("count"))
++                    .and_then(|count| count.as_u64());
++                if let Some(count) = background_task_count
++                    && let Ok(count) = usize::try_from(count)
++                    && count != self.background_task_count
++                {
++                    self.background_task_count = count;
++                    cx.emit(AcpThreadEvent::BackgroundTasksUpdated);
++                }
+             }
+             acp_v1::SessionUpdate::AvailableCommandsUpdate(acp_v1::AvailableCommandsUpdate {
+                 available_commands,
+@@ -18781,6 +18816,78 @@ mod tests {
+         );
+     }
+ 
++    #[gpui::test]
++    async fn test_session_info_update_tracks_background_task_count(cx: &mut TestAppContext) {
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        let project = Project::test(fs, [], cx).await;
++        let connection = Rc::new(FakeAgentConnection::new());
++        let thread = cx
++            .update(|cx| {
++                connection.clone().new_session(
++                    project,
++                    PathList::new(&[Path::new(path!("/test"))]),
++                    cx,
++                )
++            })
++            .await
++            .unwrap();
++
++        let events = Rc::new(RefCell::new(0usize));
++        let events_for_subscription = events.clone();
++        thread.update(cx, |_thread, cx| {
++            cx.subscribe(
++                &thread,
++                move |_thread, _event_thread, event: &AcpThreadEvent, _cx| {
++                    if matches!(event, AcpThreadEvent::BackgroundTasksUpdated) {
++                        *events_for_subscription.borrow_mut() += 1;
++                    }
++                },
++            )
++            .detach();
++        });
++
++        let send = |update: acp_v1::SessionInfoUpdate, cx: &mut TestAppContext| {
++            thread
++                .update(cx, |thread, cx| {
++                    thread.handle_session_update(acp_v1::SessionUpdate::SessionInfoUpdate(update), cx)
++                })
++                .expect("session info update should succeed");
++        };
++        let with_count = |count: u64| {
++            let mut meta = serde_json::Map::new();
++            meta.insert(
++                CLAUDE_BACKGROUND_TASKS_META_KEY.to_string(),
++                serde_json::json!({ "count": count, "tasks": [] }),
++            );
++            acp_v1::SessionInfoUpdate::new().meta(meta)
++        };
++
++        send(with_count(2), cx);
++        thread.read_with(cx, |thread, _| {
++            assert_eq!(thread.background_task_count(), 2)
++        });
++        assert_eq!(*events.borrow(), 1);
++
++        // A title-only update carries no count, and must not read as "none left".
++        send(acp_v1::SessionInfoUpdate::new().title("Renamed"), cx);
++        thread.read_with(cx, |thread, _| {
++            assert_eq!(thread.background_task_count(), 2)
++        });
++
++        // An unchanged count is not news.
++        send(with_count(2), cx);
++        assert_eq!(*events.borrow(), 1);
++
++        send(with_count(0), cx);
++        thread.read_with(cx, |thread, _| {
++            assert_eq!(thread.background_task_count(), 0);
++            assert_eq!(thread.status(), ThreadStatus::Idle);
++        });
++        assert_eq!(*events.borrow(), 2);
++    }
++
+     #[gpui::test]
+     async fn test_session_info_update_replaces_provisional_title_and_emits_event(
+         cx: &mut TestAppContext,
+diff --git a/crates/agent_ui/src/agent_diff.rs b/crates/agent_ui/src/agent_diff.rs
+index f943a3c..9727fae 100644
+--- a/crates/agent_ui/src/agent_diff.rs
++++ b/crates/agent_ui/src/agent_diff.rs
+@@ -1472,6 +1472,7 @@ impl AgentDiff {
+             | AcpThreadEvent::SubmissionUpdated(_)
+             | AcpThreadEvent::TokenUsageUpdated
+             | AcpThreadEvent::AccountUsageUpdated
++            | AcpThreadEvent::BackgroundTasksUpdated
+             | AcpThreadEvent::NoticesUpdated
+             | AcpThreadEvent::SubagentSpawned(_)
+             | AcpThreadEvent::EntriesRemoved(_)
+diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
+index ea61856..ab926d7 100644
+--- a/crates/agent_ui/src/conversation_view.rs
++++ b/crates/agent_ui/src/conversation_view.rs
+@@ -339,6 +339,7 @@ impl Conversation {
+                     | AcpThreadEvent::TitleUpdated
+                     | AcpThreadEvent::TokenUsageUpdated
+                     | AcpThreadEvent::AccountUsageUpdated
++                    | AcpThreadEvent::BackgroundTasksUpdated
+                     | AcpThreadEvent::EntryUpdated(_)
+                     | AcpThreadEvent::EntriesRemoved(_)
+                     | AcpThreadEvent::Retry(_)
+@@ -759,6 +760,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
+         | AcpThreadEvent::Retry(_)
+         | AcpThreadEvent::TokenUsageUpdated
+         | AcpThreadEvent::AccountUsageUpdated
++        | AcpThreadEvent::BackgroundTasksUpdated
+         | AcpThreadEvent::PromptCapabilitiesUpdated
+         | AcpThreadEvent::AvailableCommandsUpdated(_)
+         | AcpThreadEvent::ModeUpdated(_)
+@@ -2094,6 +2096,10 @@ impl ConversationView {
+                     });
+                 }
+             }
++            // Nothing to recompute here. The `cx.notify()` below is what reaches the
++            // sidebar: the agent panel observes every conversation view, active or not,
++            // and asks the sidebar to rebuild, which re-reads the thread's status.
++            AcpThreadEvent::BackgroundTasksUpdated => {}
+             AcpThreadEvent::AccountUsageUpdated => {
+                 // A redraw is all this needs: the account section is built from the thread
+                 // when the tooltip opens, so there is no per-turn state to recompute.
+diff --git a/crates/sidebar/src/sidebar.rs b/crates/sidebar/src/sidebar.rs
+index 2287857..c7f9671 100644
+--- a/crates/sidebar/src/sidebar.rs
++++ b/crates/sidebar/src/sidebar.rs
+@@ -1849,7 +1849,14 @@ impl Sidebar {
+                         && session_id
+                             .as_ref()
+                             .and_then(|sid| old_statuses.get(sid))
+-                            .is_some_and(|(s, _)| *s == AgentThreadStatus::Running)
++                            .is_some_and(|(s, _)| {
++                                // Work finishing out of sight is news whether it ended a
++                                // turn or the last background task after one.
++                                matches!(
++                                    s,
++                                    AgentThreadStatus::Running | AgentThreadStatus::Background
++                                )
++                            })
+                     {
+                         notified_threads.insert(thread.metadata.thread_id);
+                     }
+@@ -1889,7 +1896,10 @@ impl Sidebar {
+                         let old_status = old_statuses.get(&info.session_id).map(|(s, _)| *s);
+                         new_live_statuses.insert(info.session_id.clone(), (info.status, thread_id));
+                         if info.status == AgentThreadStatus::Completed
+-                            && old_status == Some(AgentThreadStatus::Running)
++                            && matches!(
++                                old_status,
++                                Some(AgentThreadStatus::Running | AgentThreadStatus::Background)
++                            )
+                         {
+                             notified_threads.insert(thread_id);
+                         }
+@@ -5822,7 +5832,9 @@ impl Sidebar {
+                     AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation => {
+                         return;
+                     }
+-                    AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
++                    AgentThreadStatus::Completed
++                    | AgentThreadStatus::Background
++                    | AgentThreadStatus::Error => {}
+                 }
+                 if thread.draft.is_some() {
+                     let workspace = thread.workspace.clone();
+@@ -8182,6 +8194,9 @@ fn all_thread_infos_for_workspace(
+             } else {
+                 match thread.status() {
+                     ThreadStatus::Generating => AgentThreadStatus::Running,
++                    ThreadStatus::Idle if thread.background_task_count() > 0 => {
++                        AgentThreadStatus::Background
++                    }
+                     ThreadStatus::Idle => AgentThreadStatus::Completed,
+                 }
+             };
+diff --git a/crates/sidebar/src/sidebar_tests.rs b/crates/sidebar/src/sidebar_tests.rs
+index a235b37..802c1e0 100644
+--- a/crates/sidebar/src/sidebar_tests.rs
++++ b/crates/sidebar/src/sidebar_tests.rs
+@@ -680,6 +680,7 @@ fn visible_entries_as_strings(
+                             let live = if thread.is_live { " *" } else { "" };
+                             let status_str = match thread.status {
+                                 AgentThreadStatus::Running => " (running)",
++                                AgentThreadStatus::Background => " (background)",
+                                 AgentThreadStatus::Error => " (error)",
+                                 AgentThreadStatus::WaitingForConfirmation => " (waiting)",
+                                 _ => "",
+@@ -4555,6 +4556,72 @@ async fn test_background_thread_completion_triggers_notification(cx: &mut TestAp
+     );
+ }
+ 
++#[gpui::test]
++async fn test_background_tasks_outlive_the_turn_in_the_sidebar(cx: &mut TestAppContext) {
++    let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
++    let (multi_workspace, cx) =
++        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
++    let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
++
++    let connection_a = StubAgentConnection::new();
++    open_thread_with_connection(&panel_a, connection_a.clone(), cx);
++    send_message(&panel_a, cx);
++
++    let session_id_a = active_session_id(&panel_a, cx);
++    save_test_thread_metadata(&session_id_a, &project_a, cx).await;
++
++    let background_tasks = |count: u64| {
++        let mut meta = serde_json::Map::new();
++        meta.insert(
++            "_claude/backgroundTasks".to_string(),
++            serde_json::json!({ "count": count, "tasks": [] }),
++        );
++        acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(meta))
++    };
++
++    // The turn launches a background shell, then ends while it keeps running.
++    cx.update(|_, cx| {
++        connection_a.send_update(session_id_a.clone(), background_tasks(1), cx);
++    });
++    cx.run_until_parked();
++
++    let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
++    let project_b = project::Project::test(fs, [], cx).await;
++    multi_workspace.update_in(cx, |mw, window, cx| {
++        mw.test_add_workspace(project_b, window, cx);
++    });
++    cx.run_until_parked();
++
++    connection_a.end_turn(session_id_a.clone(), acp::StopReason::EndTurn);
++    cx.run_until_parked();
++
++    // The turn is over, so it is no longer "running" -- but the work is not done, so
++    // it is not "finished" either.
++    assert_eq!(
++        visible_entries_as_strings(&sidebar, cx),
++        vec![
++            //
++            "v [project-a]",
++            "  Hello * (background)",
++        ]
++    );
++
++    // The last background task ends between turns, with no turn to carry the news.
++    cx.update(|_, cx| {
++        connection_a.send_update(session_id_a.clone(), background_tasks(0), cx);
++    });
++    cx.run_until_parked();
++
++    assert_eq!(
++        visible_entries_as_strings(&sidebar, cx),
++        vec![
++            //
++            "v [project-a]",
++            "  Hello * (!)",
++        ]
++    );
++}
++
+ fn type_in_search(sidebar: &Entity<Sidebar>, query: &str, cx: &mut gpui::VisualTestContext) {
+     sidebar.update_in(cx, |sidebar, window, cx| {
+         window.focus(&sidebar.filter_editor.focus_handle(cx), cx);
+diff --git a/crates/ui/src/components/ai/thread_item.rs b/crates/ui/src/components/ai/thread_item.rs
+index 7cf5748..ba13b04 100644
+--- a/crates/ui/src/components/ai/thread_item.rs
++++ b/crates/ui/src/components/ai/thread_item.rs
+@@ -12,6 +12,9 @@ pub enum AgentThreadStatus {
+     #[default]
+     Completed,
+     Running,
++    /// The turn is over but the agent still has work running in the background — a
++    /// backgrounded shell, an async subagent — which a new turn may follow.
++    Background,
+     WaitingForConfirmation,
+     Error,
+ }
+@@ -341,6 +344,17 @@ impl RenderOnce for ThreadItem {
+                         .with_rotate_animation(2),
+                 )
+                 .into_any_element()
++        } else if self.status == AgentThreadStatus::Background {
++            // The same glyph as a running turn, so it still reads as "working", but tinted
++            // and slower so the two stay apart at a glance.
++            icon_container()
++                .child(
++                    Icon::new(IconName::LoadCircle)
++                        .size(IconSize::Small)
++                        .color(Color::Accent)
++                        .with_rotate_animation(4),
++                )
++                .into_any_element()
+         } else if let Some(status_icon) = status_icon {
+             icon_container().child(status_icon).into_any_element()
+         } else {
+@@ -402,7 +416,9 @@ impl RenderOnce for ThreadItem {
+ 
+         let show_tooltip = matches!(
+             self.status,
+-            AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
++            AgentThreadStatus::Error
++                | AgentThreadStatus::WaitingForConfirmation
++                | AgentThreadStatus::Background
+         );
+ 
+         let linked_worktrees: Vec<ThreadItemWorktreeInfo> = self
+@@ -628,6 +644,15 @@ impl RenderOnce for ThreadItem {
+                         )
+                         .child(Label::new("Waiting for Confirmation"))
+                         .into_any_element(),
++                    AgentThreadStatus::Background => h_flex()
++                        .gap_1()
++                        .child(
++                            Icon::new(IconName::LoadCircle)
++                                .size(IconSize::Small)
++                                .color(Color::Accent),
++                        )
++                        .child(Label::new("Running in the Background"))
++                        .into_any_element(),
+                     _ => gpui::Empty.into_any_element(),
+                 }))
+             })
+@@ -699,6 +724,17 @@ impl Component for ThreadItem {
+                     )
+                     .into_any_element(),
+             ),
++            single_example(
++                "Running in the Background",
++                container()
++                    .child(
++                        ThreadItem::new("ti-3b", "Start the dev server and watch the logs")
++                            .icon(IconName::AiClaude)
++                            .timestamp("1h")
++                            .status(AgentThreadStatus::Background),
++                    )
++                    .into_any_element(),
++            ),
+             single_example(
+                 "In Worktree",
+                 container()
