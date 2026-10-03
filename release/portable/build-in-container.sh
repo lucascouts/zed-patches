@@ -55,6 +55,11 @@ export ZED_UPDATE_EXPLANATION="Update Zeo where you installed it: your package m
 export LK_CUSTOM_WEBRTC=/work/webrtc/linux-x64-release
 export RUSTFLAGS="-C target-cpu=x86-64-v3 -C symbol-mangling-version=v0 --cfg tokio_unstable"
 export CFLAGS="-O2 -march=x86-64-v3" CXXFLAGS="-O2 -march=x86-64-v3"
+# clang, as upstream's script/bundle-linux uses: Debian 12's GCC 12 rejects the
+# prebuilt WebRTC headers ("declaration ... changes meaning of 'Network'"), and
+# the -Wno-changes-meaning that webrtc-sys passes to silence it only exists from
+# GCC 13 on. The diagnostic is GCC's alone.
+export CC=clang CXX=clang++
 export CARGO_TARGET_DIR=/work/target CARGO_HOME=/work/cargo-home
 log "building (cargo build --release --locked)"
 cargo build --release --locked --package zed --package cli --features zed/mimalloc

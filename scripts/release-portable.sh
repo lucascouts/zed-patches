@@ -59,8 +59,12 @@ main() {
 	local image
 	image="zeo-portable:$(sha256sum "${here}/Containerfile" | cut -c1-12)"
 	printf 'image %s\n' "${image}"
-	docker build -q -t "${image}" -f "${here}/Containerfile" "${here}" >/dev/null ||
-		die 1 "the build image failed to build"
+	# The tag is the Containerfile's hash, so an existing image is the one this
+	# file describes; rebuilding it would only re-download the toolchain.
+	if ! docker image inspect "${image}" >/dev/null 2>&1; then
+		docker build -q -t "${image}" -f "${here}/Containerfile" "${here}" >/dev/null ||
+			die 1 "the build image failed to build"
+	fi
 
 	local run=(docker run --rm --user "$(id -u):$(id -g)" -e HOME=/work
 		-e "ZEO_PV=${pv}" -e "ZEO_PVR=${pvr}"

@@ -28,15 +28,19 @@ XZ_OPT=-9T0 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${epoc
 revision=0
 [[ "${ZEO_PVR}" =~ -r([0-9]+)$ ]] && revision="${BASH_REMATCH[1]}"
 export ZEO_STAGE="${stage}" ZEO_VERSION="${ZEO_PV/_p/~p}" ZEO_RELEASE=$((revision + 1))
+# nfpm expands the environment in a few fields only, not in contents' src paths,
+# so the config is expanded here, and only for these three names.
+# shellcheck disable=SC2016  # the names are for envsubst, not for this shell
+envsubst '${ZEO_STAGE} ${ZEO_VERSION} ${ZEO_RELEASE}' < /pkg/nfpm.yaml > /out/nfpm.yaml
 for packager in deb rpm; do
 	log "${packager}"
-	nfpm package --config /pkg/nfpm.yaml --packager "${packager}" --target "${dist}/"
+	nfpm package --config /out/nfpm.yaml --packager "${packager}" --target "${dist}/"
 done
 
 # 3. AppImage. AppRun execs the editor binary itself, not the zeo CLI: the CLI
 # spawns the editor and exits, and an AppImage unmounts when its first process
 # exits, which would pull the files out from under the running editor.
-# libxkbcommon(-x11) ride along because they are the two libraries the binary
+# libxkbcommon(-x11) ride along, with the libxcb-xkb the -x11 half needs, because they are the two libraries the binary
 # links that a minimal desktop install can lack; everything else it needs
 # (glibc, glib, alsa, xcb, wayland, vulkan, X11) is on any desktop, and
 # AppImage convention is to not bundle those.
@@ -45,7 +49,8 @@ appdir=/out/AppDir
 rm -rf "${appdir}"
 mkdir -p "${appdir}/usr/lib"
 cp -a "${stage}/usr/." "${appdir}/usr/"
-for lib in libxkbcommon.so.0 libxkbcommon-x11.so.0; do
+# libxcb-xkb comes with libxkbcommon-x11, which needs it.
+for lib in libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1; do
 	cp -L "/usr/lib/x86_64-linux-gnu/${lib}" "${appdir}/usr/lib/"
 done
 cat > "${appdir}/AppRun" <<'EOF'

@@ -38,21 +38,29 @@ contents:
     dst: /usr/share/metainfo/dev.zeo.Zeo.metainfo.xml
 
 # Runtime libraries: the binary's NEEDED entries plus what gpui dlopen()s
-# (Vulkan, the Wayland client, libX11), the same set the zeo-bin ebuild names.
+# (Vulkan, the Wayland client, libX11). The portable build also links
+# libX11-xcb, which the Gentoo zeo-bin does not -- a minimal Ubuntu without it
+# failed to start the AppImage -- so it is named here explicitly rather than
+# left to arrive with another package.
 overrides:
   deb:
     depends:
       - libc6 (>= 2.36)
       - libgcc-s1
       - libstdc++6
-      - libasound2 | libasound2t64
-      - libglib2.0-0 | libglib2.0-0t64
+      # The t64 name first. On Ubuntu 24.04 the bare libasound2 is also provided
+      # by liboss4-salsa-asound2, an OSS shim without the full ALSA API, and apt
+      # picked it: zeo-editor then died on snd_device_name_get_hint. Debian 12
+      # has no t64 name, so it falls through to the real libasound2.
+      - libasound2t64 | libasound2
+      - libglib2.0-0t64 | libglib2.0-0
       - libxcb1
       - libxkbcommon0
       - libxkbcommon-x11-0
       - libvulkan1
       - libwayland-client0
       - libx11-6
+      - libx11-xcb1
     recommends:
       - fonts-dejavu-core
   rpm:
@@ -68,6 +76,7 @@ overrides:
       - vulkan-loader
       - libwayland-client
       - libX11
+      - libX11-xcb
     recommends:
       - dejavu-sans-fonts
 
