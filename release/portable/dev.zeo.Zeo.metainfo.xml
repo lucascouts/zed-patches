@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.zeo.Zeo</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later AND Apache-2.0</project_license>
+  <name>Zeo</name>
+  <summary>The Zed editor, rebranded, with the bentoo patch series</summary>
+  <developer id="dev.zeo">
+    <name>zeo-workspace</name>
+  </developer>
+  <description>
+    <p>
+      Zeo is a build of the Zed editor with a downstream patch series on top:
+      richer agent-panel integration for the Claude agent adapters, thread
+      organisation, and a few editor refinements. It is a patch set applied to
+      a named Zed commit, not a fork.
+    </p>
+    <p>
+      Zeo is an independent project and is not affiliated with, endorsed by, or
+      supported by Zed Industries.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.zeo.Zeo.desktop</launchable>
+  <url type="homepage">https://github.com/zeo-workspace/zeo</url>
+  <url type="bugtracker">https://github.com/zeo-workspace/zeo/issues</url>
+  <url type="vcs-browser">https://github.com/zeo-workspace/zed-patches</url>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>zeo</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>TextEditor</category>
+  </categories>
+</component>

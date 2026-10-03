@@ -1,0 +1,79 @@
+# .deb and .rpm from the portable staging tree. Expanded by nfpm from the
+# environment: ZEO_STAGE (the usr/ tree's parent), ZEO_VERSION, ZEO_RELEASE.
+#
+# Versions: Gentoo's 0.1.0_p20261003-r1 becomes upstream version 0.1.0~p20261003
+# with release 2 (-rN is release N+1). The tilde sorts before a plain 0.1.0 in
+# both dpkg and rpm, which is right for a pre-release snapshot.
+name: zeo
+arch: amd64
+platform: linux
+version: ${ZEO_VERSION}
+version_schema: none
+release: ${ZEO_RELEASE}
+section: editors
+priority: optional
+maintainer: Lucas C.S. <lucascs@proton.me>
+vendor: zeo-workspace
+homepage: https://github.com/zeo-workspace/zeo
+license: GPL-3.0-or-later AND Apache-2.0
+description: |-
+  Zeo - the Zed editor, rebranded, with the bentoo patch series.
+  Built for x86-64-v3 (Haswell / Zen 1 or newer). Not affiliated with
+  Zed Industries.
+
+contents:
+  - src: ${ZEO_STAGE}/usr/bin/zeo
+    dst: /usr/bin/zeo
+    file_info: { mode: 0755 }
+  - src: ${ZEO_STAGE}/usr/libexec/zeo-editor
+    dst: /usr/libexec/zeo-editor
+    file_info: { mode: 0755 }
+  - src: ${ZEO_STAGE}/usr/share/applications/dev.zeo.Zeo.desktop
+    dst: /usr/share/applications/dev.zeo.Zeo.desktop
+  - src: ${ZEO_STAGE}/usr/share/icons/hicolor/512x512/apps/dev.zeo.Zeo.png
+    dst: /usr/share/icons/hicolor/512x512/apps/dev.zeo.Zeo.png
+  - src: ${ZEO_STAGE}/usr/share/icons/hicolor/1024x1024/apps/dev.zeo.Zeo.png
+    dst: /usr/share/icons/hicolor/1024x1024/apps/dev.zeo.Zeo.png
+  - src: ${ZEO_STAGE}/usr/share/metainfo/dev.zeo.Zeo.metainfo.xml
+    dst: /usr/share/metainfo/dev.zeo.Zeo.metainfo.xml
+
+# Runtime libraries: the binary's NEEDED entries plus what gpui dlopen()s
+# (Vulkan, the Wayland client, libX11), the same set the zeo-bin ebuild names.
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.36)
+      - libgcc-s1
+      - libstdc++6
+      - libasound2 | libasound2t64
+      - libglib2.0-0 | libglib2.0-0t64
+      - libxcb1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libvulkan1
+      - libwayland-client0
+      - libx11-6
+    recommends:
+      - fonts-dejavu-core
+  rpm:
+    depends:
+      - glibc >= 2.36
+      - libgcc
+      - libstdc++
+      - alsa-lib
+      - glib2
+      - libxcb
+      - libxkbcommon
+      - libxkbcommon-x11
+      - vulkan-loader
+      - libwayland-client
+      - libX11
+    recommends:
+      - dejavu-sans-fonts
+
+deb:
+  fields:
+    Bugs: https://github.com/zeo-workspace/zeo/issues
+rpm:
+  group: Applications/Editors
+  summary: Zeo - the Zed editor with the bentoo patch series

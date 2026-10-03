@@ -1,0 +1,38 @@
+# Flatpak of the portable build. Wraps the prebuilt tree rather than compiling
+# in flatpak-builder's sandbox: the bytes are the ones the .deb/.rpm/AppImage
+# ship, built once in the Debian 12 image. scripts/release-portable.sh copies
+# the portable tarball next to this file as zeo-portable.tar.xz.
+#
+# Like Zed's own Flatpak, Zeo does not stay in the sandbox: the zeo CLI re-runs
+# itself on the host through `flatpak-spawn --host` (patch 0032 makes that path
+# recognise dev.zeo.Zeo), so the terminal, language servers and agents see the
+# host's tools. The permissions below are Zed's Flathub set for that reason.
+app-id: dev.zeo.Zeo
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+command: zeo
+finish-args:
+  - --talk-name=org.freedesktop.Flatpak
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  - --filesystem=host
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.freedesktop.secrets
+modules:
+  - name: zeo
+    buildsystem: simple
+    sources:
+      - type: archive
+        path: zeo-portable.tar.xz
+        strip-components: 1
+    build-commands:
+      - install -Dm755 usr/bin/zeo /app/bin/zeo
+      - install -Dm755 usr/libexec/zeo-editor /app/libexec/zeo-editor
+      - install -Dm644 usr/share/applications/dev.zeo.Zeo.desktop /app/share/applications/dev.zeo.Zeo.desktop
+      - install -Dm644 usr/share/icons/hicolor/512x512/apps/dev.zeo.Zeo.png /app/share/icons/hicolor/512x512/apps/dev.zeo.Zeo.png
+      - install -Dm644 usr/share/metainfo/dev.zeo.Zeo.metainfo.xml /app/share/metainfo/dev.zeo.Zeo.metainfo.xml

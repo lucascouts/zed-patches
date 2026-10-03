@@ -1,0 +1,71 @@
+# The portable Zeo build: the same Zed commit and patch series as app-editors/zeo,
+# compiled against Debian 12's glibc (2.36) so the result runs on Debian 12+,
+# Ubuntu 23.04+, Fedora 37+ and anything newer. The Gentoo-built zeo-bin cannot be
+# repackaged for those: it links against this host's glibc (2.44) and dies on
+# start anywhere older.
+#
+# Every input is pinned: the base image by digest, rustup-init, nfpm, appimagetool
+# and the AppImage runtime by version and sha256. Build with
+# scripts/release-portable.sh, which passes nothing but the source to this image.
+FROM debian:12@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26
+
+# Upstream's own Debian 12 build dependencies (script/linux in the Zed tree, with
+# libstdc++-12-dev as it prescribes for Debian 12), minus the runtime-only
+# pipewire and xdg-desktop-portal, plus the packaging tools used afterwards.
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+		build-essential ca-certificates clang cmake curl elfutils file gcc g++ \
+		gettext-base git jq libasound2-dev libfontconfig-dev libgit2-dev \
+		libglib2.0-dev libsqlite3-dev libssl-dev libstdc++-12-dev libva-dev \
+		libvulkan1 libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+		libzstd-dev lld llvm make musl-dev musl-tools patch pkg-config unzip \
+		xz-utils binutils desktop-file-utils squashfs-tools \
+	&& rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup \
+	CARGO_HOME=/opt/cargo \
+	PATH=/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+# rustup-init 1.29.1 (2026-09-01). The toolchain is the one rust-toolchain.toml
+# pins for this Zed commit, with every component and target that file lists, so
+# nothing is fetched on the first cargo run.
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+ARG RUST_TOOLCHAIN=1.98.1
+RUN curl -fsSLo /tmp/rustup-init \
+		"https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+	&& echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+	&& chmod +x /tmp/rustup-init \
+	&& /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" \
+		--component rustfmt,clippy,rust-analyzer,rust-src \
+		--target wasm32-wasip2,wasm32-unknown-unknown,x86_64-unknown-linux-musl \
+	&& rm /tmp/rustup-init \
+	&& chmod -R a+rwX /opt/rustup /opt/cargo
+
+# nfpm 2.47.0 (2026-06-20): one config, both .deb and .rpm.
+ARG NFPM_VERSION=2.47.0
+ARG NFPM_SHA256=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+RUN curl -fsSLo /tmp/nfpm.tgz \
+		"https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+	&& echo "${NFPM_SHA256}  /tmp/nfpm.tgz" | sha256sum -c - \
+	&& tar -xzf /tmp/nfpm.tgz -C /usr/local/bin nfpm \
+	&& rm /tmp/nfpm.tgz
+
+# appimagetool 1.9.1 (2025-11-18), extracted so it runs without FUSE, and the
+# type2 runtime 20251108 handed to it explicitly -- otherwise appimagetool
+# downloads an unpinned "continuous" runtime at packaging time.
+ARG APPIMAGETOOL_VERSION=1.9.1
+ARG APPIMAGETOOL_SHA256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+ARG APPIMAGE_RUNTIME_VERSION=20251108
+ARG APPIMAGE_RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+RUN curl -fsSLo /tmp/appimagetool \
+		"https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage" \
+	&& echo "${APPIMAGETOOL_SHA256}  /tmp/appimagetool" | sha256sum -c - \
+	&& chmod +x /tmp/appimagetool \
+	&& cd /opt && /tmp/appimagetool --appimage-extract >/dev/null \
+	&& mv /opt/squashfs-root /opt/appimagetool \
+	&& ln -s /opt/appimagetool/AppRun /usr/local/bin/appimagetool \
+	&& rm /tmp/appimagetool \
+	&& curl -fsSLo /opt/appimage-runtime-x86_64 \
+		"https://github.com/AppImage/type2-runtime/releases/download/${APPIMAGE_RUNTIME_VERSION}/runtime-x86_64" \
+	&& echo "${APPIMAGE_RUNTIME_SHA256}  /opt/appimage-runtime-x86_64" | sha256sum -c -
