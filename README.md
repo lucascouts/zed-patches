@@ -269,7 +269,11 @@ manages the patches, not to the upstream code they carry.
 ## Releasing zeo-bin
 
 `zeo-bin` is the same build as `zeo` at the same `PV`, compiled once here and
-published to the overlay's R2 bucket (`distfiles.obentoo.org`). The host's own
+published as an asset of the Zeo GitHub release tagged `v<PVR>`
+([`zeo-workspace/zeo` releases](https://github.com/zeo-workspace/zeo/releases)), beside
+its `PROVENANCE` and `SHA256SUMS`; the `zeo-bin` ebuild's `SRC_URI` points there. Until
+2026-10-03 the tarballs were served from the overlay's R2 bucket
+(`distfiles.obentoo.org`), which still holds the three published before the move. The host's own
 `make.conf` targets `znver5` and *appends* that to any `RUSTFLAGS` passed on the
 command line, so the build runs under the versioned `release/configroot/` instead,
 which targets `x86-64-v3`. No root is needed: `ebuild` runs unprivileged here.
@@ -281,11 +285,13 @@ scripts/release-zeo-bin.sh <PF> --fresh   # discard the previous build first
 
 The script checks the flags and scans the binary for AVX-512 before writing
 `${DISTDIR}/zeo-bin-<PVR>-amd64.tar.xz` — the zeo revision stays in the name, since a
-revbump is a different binary — and compares it with what R2 already serves under that
-name: identical bytes mean nothing to upload, different bytes are refused, because the
-`zeo-bin` Manifest pins the published ones. Otherwise it prints the upload command. Uploading is
-a publication: it waits for an explicit go-ahead every time. Then the `zeo-bin`
-ebuild's `Manifest` is regenerated against the uploaded file. The archive is
+revbump is a different binary — and compares it with what the `v<PVR>` release already
+serves under that name: identical bytes mean nothing to upload, different bytes are
+refused, because the `zeo-bin` Manifest pins the published ones. Otherwise it prints the
+release steps: tag `v<PVR>` in this repository (on the commit holding `patches/<PF>/`)
+and in `zeo`, then `gh release create` with the three assets. Publishing waits for an
+explicit go-ahead every time. Then the `zeo-bin` ebuild's `Manifest` is regenerated
+against the published file. The archive is
 deterministic — the same build gives the same sha256 — so a rerun does not
 invalidate a Manifest already made from it.
 

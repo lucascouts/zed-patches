@@ -17,8 +17,8 @@
 # install does not cost the 20-minute compile again; --fresh discards it.
 #
 # It never uploads and never touches the zeo-bin Manifest: the Manifest must
-# describe the bytes on R2, so it is regenerated only after the upload, which a
-# human authorizes each time. The steps are printed at the end.
+# describe the bytes the Zeo GitHub release serves, so it is regenerated only
+# after the upload, which a human authorizes each time. The steps are printed at the end.
 #
 # Environment: ZP_RELEASE_TMPDIR (default ~/.cache/zeo-release) and the ZP_*
 # overrides lib.sh honours, ZP_OVERLAY among them.

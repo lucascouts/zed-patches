@@ -12,16 +12,18 @@
 #
 # Writes ${DISTDIR}/zeo-bin-<PVR>-amd64.tar.xz, whose single top directory holds
 # the installed usr/ tree and PROVENANCE.txt, and prints the upload command.
-# A name R2 already serves is checked first: identical bytes end the run with
-# nothing to upload, different bytes are refused (ZP_DISTFILES_URL overrides the
-# host, for testing). It never uploads: publishing to R2 is a remote, outward-facing step that a
-# human authorizes each time.
+# The tarball is published as an asset of the Zeo GitHub release tagged
+# v<PVR> (zeo-workspace/zeo), which the zeo-bin ebuild's SRC_URI names. A name
+# that release already serves is checked first: identical bytes end the run with
+# nothing to upload, different bytes are refused (ZP_RELEASE_URL overrides the
+# download base, for testing). It never uploads or tags: publishing is a remote,
+# outward-facing step that a human authorizes each time.
 #
 # Refuses to package a binary that is not portable: one built with a target CPU
 # other than x86-64-v3, or one carrying AVX-512 instructions.
 #
 # Exit: 0 written or already published · 1 the build is not releasable, or its
-# name is taken on R2 by other bytes · 2 environment problem.
+# name is already published with other bytes · 2 environment problem.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -62,8 +64,8 @@ main() {
 	fi
 
 	# The revision stays in the name. A zeo revbump changes the binary, so it is a
-	# different artefact: dropping -rN would put new bytes under a name R2 already
-	# serves and a Manifest already pins. zeo-bin mirrors zeo's PVR, and its
+	# different artefact: dropping -rN would put new bytes under a name a release
+	# already serves and a Manifest already pins. zeo-bin mirrors zeo's PVR, and its
 	# SRC_URI names ${PF} for the same reason.
 	local pv="${pf#zeo-}" name stage out
 	name="zeo-bin-${pv}"
@@ -107,12 +109,14 @@ main() {
 	XZ_OPT=-9T0 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${epoch}" \
 		-C "${stage}" -cJf "${out}" "${name}"
 
-	# A name already on R2 is a published artefact. Identical bytes mean there is
-	# nothing to upload; different bytes mean this build must not take that name,
-	# because the zeo-bin Manifest pins the published ones.
-	local url="${ZP_DISTFILES_URL:-https://distfiles.obentoo.org}/${name}-amd64.tar.xz" remote_sum local_sum
+	# A name the release already serves is a published artefact. Identical bytes
+	# mean there is nothing to upload; different bytes mean this build must not
+	# take that name, because the zeo-bin Manifest pins the published ones.
+	# -L: GitHub answers a release download with a redirect to its asset store.
+	local base="${ZP_RELEASE_URL:-https://github.com/zeo-workspace/zeo/releases/download}"
+	local url="${base}/v${pv}/${name}-amd64.tar.xz" remote_sum local_sum
 	local_sum="$(sha256sum "${out}" | cut -d' ' -f1)"
-	if curl -sfI "${url}" >/dev/null 2>&1; then
+	if curl -sfIL "${url}" >/dev/null 2>&1; then
 		remote_sum="$(curl -sfL "${url}" | sha256sum | cut -d' ' -f1)"
 		if [[ "${remote_sum}" == "${local_sum}" ]]; then
 			printf 'already published with identical bytes: %s\n' "${url}"
@@ -125,12 +129,16 @@ main() {
 wrote ${out} ($(stat -c %s "${out}") bytes)
 sha256 ${local_sum}
 
-next, once publishing is authorized:
-  1. from the overlay checkout (wrangler profile 'bentoo'):
-     npx --yes wrangler@<a release at least 7 days old> r2 object put obentoo-distfiles/${name}-amd64.tar.xz \\
-       --file=${out} --content-type=application/x-xz --remote
-  2. curl -sI https://distfiles.obentoo.org/${name}-amd64.tar.xz   # expect 200
-  3. ebuild <overlay>/app-editors/zeo-bin/${name}.ebuild manifest
+next, once publishing is authorized (zeo-workspace/zeo releases):
+  1. tag v${pv}: in zed-patches on the commit that holds patches/${pf}/, and in zeo
+     on its HEAD -- annotated, then git push origin v${pv} in each
+  2. in a scratch directory:
+     tar -xOJf ${out} ${name}/PROVENANCE.txt > PROVENANCE-${pv}.txt
+     sha256sum ${out##*/} PROVENANCE-${pv}.txt > SHA256SUMS-${pv}   # with the tarball copied beside them
+     gh release create v${pv} -R zeo-workspace/zeo --verify-tag -t "Zeo ${pv}" -F <notes.md> \\
+       ${name}-amd64.tar.xz PROVENANCE-${pv}.txt SHA256SUMS-${pv}
+  3. curl -sfL ${url} | sha256sum   # expect ${local_sum}
+  4. ebuild <overlay>/app-editors/zeo-bin/${name}.ebuild manifest
 EOF
 }
 
